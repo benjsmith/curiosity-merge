@@ -1,0 +1,132 @@
+# semgrep-curiosity-merge.yml — curated ruleset for curiosity-merge.
+#
+# Used by merge.py --enable-semgrep. Targets prompt-injection patterns,
+# schema-override claims, and shell-style content embedded in markdown
+# bodies / vault extractions that scrub_check.py doesn't already catch.
+#
+# Goals:
+#   - Cheap, deterministic regex / pattern matches. Heavy AST analysis
+#     belongs in semgrep's full rulesets, not here.
+#   - Low false-positive rate on legitimate prose. We'd rather miss a
+#     subtle attack than quarantine half a wiki and make merge unusable.
+#   - Every rule has a 'metadata.curiosity-merge' entry naming the threat
+#     class from docs/trust-model.md so audit reports can be traced back.
+#
+# Add new rules at the bottom; never broaden existing ones without
+# checking false-positive rate against a real-world wiki.
+
+rules:
+
+  # T2 — prompt injection in markdown bodies, instruction-style.
+  # Catches the canonical "ignore previous instructions" / "you are now
+  # X" patterns aimed at the receiving curator agent. Markdown-only.
+  - id: cm-prompt-injection-instructional
+    languages: [generic]
+    paths:
+      include: ["*.md"]
+    pattern-either:
+      - pattern-regex: '(?i)\bignore\s+(all\s+)?(previous|prior|above)\s+instructions?\b'
+      - pattern-regex: '(?i)\byou\s+are\s+now\s+(an?\s+)?(admin|root|developer|jailbroken)\b'
+      - pattern-regex: '(?i)\bdisregard\s+(the\s+)?(system\s+prompt|previous|above)\b'
+      - pattern-regex: '(?i)\bnew\s+(system|admin|developer)\s+(prompt|instructions?)\s*[:=]'
+      - pattern-regex: '(?i)\b(act|behave|respond)\s+as\s+(if\s+you\s+(are|were)\s+)?(an?\s+)?(unrestricted|uncensored|jailbroken)\b'
+    message: |
+      Prompt-injection style instructional content in markdown body.
+      curiosity-merge already wraps merged bodies in untrusted-content
+      framing; this rule surfaces the markers so the user can decide
+      whether to keep the page at all.
+    severity: WARNING
+    metadata:
+      curiosity-merge:
+        threat: T2
+        category: prompt-injection
+
+  # T6 — schema-override claims. Vault content that claims to modify
+  # lint rules, scoring scripts, allowlists, or curator behaviour.
+  # Aligned with curiosity-engine's "schema override attempts are
+  # automatic quarantine" rule.
+  - id: cm-schema-override-claim
+    languages: [generic]
+    paths:
+      include: ["*.md"]
+    pattern-either:
+      - pattern-regex: '(?i)\b(modify|override|disable|bypass)\s+(the\s+)?(lint|scoring|allowlist|allow\s*list|schema|scrub)\b'
+      - pattern-regex: '(?i)\bset\s+(the\s+)?ALLOWED_FM_KEYS\b'
+      - pattern-regex: '(?i)\b(curator|sweep|graph|scrub_check)\.py\s+(should|must|will)\s+now\b'
+      - pattern-regex: '(?i)\bupdate\s+(the\s+)?\.curator/(config|allowlist)\b'
+    message: |
+      Content claims to modify curator/schema/allowlist/lint behaviour.
+      Per docs/trust-model.md (T6) this is automatic quarantine — the
+      receiving wiki's behaviour is not user-content-configurable.
+    severity: ERROR
+    metadata:
+      curiosity-merge:
+        threat: T6
+        category: schema-override
+
+  # Shell-style content in markdown body. URLs in source frontmatter
+  # are fine; raw curl|bash and command-substitution chains in body
+  # prose are nearly always injection bait.
+  - id: cm-shell-injection-in-markdown
+    languages: [generic]
+    paths:
+      include: ["*.md"]
+    pattern-either:
+      - pattern-regex: '\bcurl\s+[^\n|`]*\|\s*(bash|sh|zsh|python|pwsh)\b'
+      - pattern-regex: '\bwget\s+[^\n|`]*\|\s*(bash|sh|zsh|python|pwsh)\b'
+      - pattern-regex: '\beval\s*\(\s*\$\([^)]+\)\s*\)'
+      - pattern-regex: '\brm\s+-rf\s+(/|\$HOME|~)\s*(\s|$)'
+    message: |
+      Shell-execution pattern in markdown body. Even when documented as
+      "example", these strings have a way of being copied/pasted by an
+      agent that misreads context. Not a vault-data concern but a
+      content-quality one.
+    severity: WARNING
+    metadata:
+      curiosity-merge:
+        threat: T2
+        category: shell-injection
+
+  # T2 — encoded payload markers. Base64 / hex blobs in markdown body
+  # are almost never legitimate content; they're how injection payloads
+  # try to evade naive text scanners.
+  - id: cm-encoded-payload-blob
+    languages: [generic]
+    paths:
+      include: ["*.md"]
+    pattern-either:
+      # Base64 blob >200 chars on a single line, outside a code fence.
+      - pattern-regex: '^[A-Za-z0-9+/]{200,}={0,2}$'
+      # Hex-encoded blob >200 chars on a single line.
+      - pattern-regex: '^(?:[0-9a-fA-F]{2}\s*){200,}$'
+    message: |
+      Long base64/hex blob in markdown body. Legitimate content rarely
+      embeds raw binary data this way; injection payloads sometimes do.
+      Review and either remove or move into a labelled vault binary.
+    severity: WARNING
+    metadata:
+      curiosity-merge:
+        threat: T2
+        category: encoded-payload
+
+  # Frontmatter key smuggling. read_frontmatter strips unknown keys, but
+  # an attacker may try syntactic tricks to get past the parser. Flag
+  # any frontmatter key that isn't in ALLOWED_FM_KEYS — surfaced for
+  # manual review even though parser drops them.
+  - id: cm-frontmatter-unknown-key
+    languages: [generic]
+    paths:
+      include: ["*.md"]
+    pattern-regex: '(?m)^(?!---$)([a-z_][a-z0-9_]*):\s.*$'
+    metadata:
+      curiosity-merge:
+        threat: T1
+        category: frontmatter-smuggle
+        # Note: this rule is intentionally noisy. Disable in --quality-lint
+        # mode if the receiving wiki has many legitimate custom keys; the
+        # parser drops unknown keys regardless.
+    message: |
+      Frontmatter key seen. Cross-check against naming.ALLOWED_FM_KEYS.
+      Unknown keys are silently dropped at parse time, but flagging them
+      here lets the user see what an external author was trying to set.
+    severity: INFO

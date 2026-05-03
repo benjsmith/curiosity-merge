@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# setup.sh — curiosity-merge installer.
+#
+# Verifies curiosity-engine is present in the workspace and exports
+# CURIOSITY_ENGINE_SCRIPTS_DIR so this skill's Python scripts can import
+# shared helpers (naming, sweep, projects, activity_log, graph,
+# lint_scores, vault_index).
+#
+# Allowlist install (so the bash surface is pre-approved on Codex,
+# Gemini, Copilot, Cursor) follows curiosity-engine's protocol but
+# extends with this skill's script paths. We delegate to curiosity-
+# engine's setup.sh for the host-detection and approval prompt; here
+# we only append the per-host marker file path so re-runs are quiet.
+
+set -e
+
+echo "=== Curiosity Merge Setup ==="
+
+_is_interactive() {
+    [ "${CURIOSITY_MERGE_NONINTERACTIVE:-0}" != "1" ] && [ -t 0 ] && [ -t 1 ]
+}
+
+# Resolve our own scripts dir. Same logical/physical dance as curiosity-
+# engine — Claude Code's <skill_path> may be a symlink; allowlist needs
+# both forms when they differ.
+_src_dir="$(dirname "$0")"
+SCRIPT_DIR_LOGICAL="$(cd "$_src_dir" && pwd)"
+SCRIPT_DIR_PHYSICAL="$(cd "$_src_dir" && pwd -P)"
+SKILL_ROOT_LOGICAL="$(dirname "$SCRIPT_DIR_LOGICAL")"
+SKILL_ROOT_PHYSICAL="$(dirname "$SCRIPT_DIR_PHYSICAL")"
+
+# Pre-flight: hard requirements. git (the wiki is a git repo), python3
+# >= 3.9, uv (canonical Python invocation is `uv run python3 ...`).
+if ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: git not found on PATH."
+    exit 1
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 not found on PATH. Install Python 3.9 or newer first."
+    exit 1
+fi
+_py_major=$(python3 -c "import sys; print(sys.version_info.major)")
+_py_minor=$(python3 -c "import sys; print(sys.version_info.minor)")
+if [ "$_py_major" -lt 3 ] || { [ "$_py_major" -eq 3 ] && [ "$_py_minor" -lt 9 ]; }; then
+    echo "ERROR: Python ${_py_major}.${_py_minor} found; needs 3.9+."
+    exit 1
+fi
+if ! command -v uv >/dev/null 2>&1; then
+    echo "ERROR: uv not found. Install from https://astral.sh/uv (curiosity-engine's setup.sh installs it)."
+    exit 1
+fi
+
+# Hard dependency: curiosity-engine must be installed somewhere this
+# workspace can find it. Probe candidates in order:
+#   1. CURIOSITY_ENGINE_SCRIPTS_DIR already set by the caller
+#   2. <skill_path>/../curiosity-engine/scripts (sibling install)
+#   3. ~/.claude/skills/curiosity-engine/scripts (Claude Code default)
+#   4. ~/.agents/skills/curiosity-engine/scripts (npx-skills physical)
+#
+# A "valid" curiosity-engine scripts dir contains naming.py + sweep.py.
+_validate_ce_scripts() {
+    [ -f "$1/naming.py" ] && [ -f "$1/sweep.py" ]
+}
+
+CE_SCRIPTS=""
+if [ -n "${CURIOSITY_ENGINE_SCRIPTS_DIR:-}" ] && _validate_ce_scripts "$CURIOSITY_ENGINE_SCRIPTS_DIR"; then
+    CE_SCRIPTS="$CURIOSITY_ENGINE_SCRIPTS_DIR"
+fi
+if [ -z "$CE_SCRIPTS" ]; then
+    for cand in \
+        "$(dirname "$SKILL_ROOT_PHYSICAL")/curiosity-engine/scripts" \
+        "$(dirname "$SKILL_ROOT_LOGICAL")/curiosity-engine/scripts" \
+        "$HOME/.claude/skills/curiosity-engine/scripts" \
+        "$HOME/.agents/skills/curiosity-engine/scripts"; do
+        if _validate_ce_scripts "$cand"; then
+            CE_SCRIPTS="$cand"
+            break
+        fi
+    done
+fi
+
+if [ -z "$CE_SCRIPTS" ]; then
+    echo ""
+    echo "ERROR: curiosity-engine not found."
+    echo ""
+    echo "curiosity-merge depends on curiosity-engine being installed in"
+    echo "the same environment. Install it first:"
+    echo ""
+    echo "  npx skills add -g -y benjsmith/curiosity-engine"
+    echo "  bash <skill_path>/scripts/setup.sh   # in your workspace"
+    echo ""
+    echo "Then re-run this setup."
+    exit 1
+fi
+
+echo "Found curiosity-engine at: $CE_SCRIPTS"
+
+# Persist the path. Two surfaces:
+#   - .curator/.curiosity-merge-env   (workspace-scoped, sourced by callers
+#     that aren't Claude Code)
+#   - ~/.config/curiosity-merge/env   (user-scoped fallback)
+#
+# Claude Code's `<skill_path>` substitution doesn't help here because we
+# need the *curiosity-engine* path, not our own. The env-var approach is
+# the durable answer.
+WORKSPACE_DIR="$(pwd)"
+mkdir -p "$WORKSPACE_DIR/.curator"
+ENV_FILE="$WORKSPACE_DIR/.curator/.curiosity-merge-env"
+{
+    echo "# curiosity-merge environment (written by setup.sh)"
+    echo "export CURIOSITY_ENGINE_SCRIPTS_DIR=\"$CE_SCRIPTS\""
+} > "$ENV_FILE"
+echo "Wrote $ENV_FILE"
+
+USER_ENV_DIR="$HOME/.config/curiosity-merge"
+mkdir -p "$USER_ENV_DIR"
+{
+    echo "# curiosity-merge environment (user-scoped fallback)"
+    echo "export CURIOSITY_ENGINE_SCRIPTS_DIR=\"$CE_SCRIPTS\""
+} > "$USER_ENV_DIR/env"
+echo "Wrote $USER_ENV_DIR/env"
+
+# Workspace must be a curiosity-engine wiki to be useful. Check for the
+# .curator directory and a wiki/ subdir; warn but don't fail if absent
+# (someone may be running setup before initializing a wiki).
+if [ ! -d "$WORKSPACE_DIR/wiki" ] || [ ! -d "$WORKSPACE_DIR/.curator" ]; then
+    echo ""
+    echo "WARNING: current directory does not look like a curiosity-engine"
+    echo "         workspace (missing wiki/ or .curator/)."
+    echo "         curiosity-merge commands operate on the current workspace's"
+    echo "         wiki/ tree — make sure you run them from the workspace root."
+fi
+
+# Allowlist install. We don't reimplement curiosity-engine's host-detection;
+# we just emit the patterns this skill needs, and the user (or curiosity-
+# engine's setup) installs them. Print the patterns to stdout so they're
+# auditable; the actual install is host-specific and handled at runtime
+# by the agent following the protocol in SKILL.md.
+echo ""
+echo "Allowlist patterns to add (host-specific install handled by your CLI):"
+for SCRIPT in subgraph_export.py discover_bridges.py merge.py reconcile.py; do
+    echo "  Bash(uv run python3 $SCRIPT_DIR_PHYSICAL/$SCRIPT:*)"
+    if [ "$SCRIPT_DIR_LOGICAL" != "$SCRIPT_DIR_PHYSICAL" ]; then
+        echo "  Bash(uv run python3 $SCRIPT_DIR_LOGICAL/$SCRIPT:*)"
+    fi
+done
+echo "  Bash(bash $SCRIPT_DIR_PHYSICAL/merge_evolve_guard.sh:*)"
+if [ "$SCRIPT_DIR_LOGICAL" != "$SCRIPT_DIR_PHYSICAL" ]; then
+    echo "  Bash(bash $SCRIPT_DIR_LOGICAL/merge_evolve_guard.sh:*)"
+fi
+
+echo ""
+echo "=== curiosity-merge ready ==="
+echo ""
+echo "Next steps:"
+echo "  source $ENV_FILE                       # load env into current shell"
+echo "  uv run python3 $SCRIPT_DIR_PHYSICAL/subgraph_export.py --help"
+echo ""
