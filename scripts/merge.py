@@ -114,8 +114,10 @@ def _validate_source(source_arg: str, workspace: Path) -> Path:
         raise SystemExit(f"source not a directory: {resolved}")
     if not (resolved / "wiki").is_dir():
         raise SystemExit(f"source missing wiki/: {resolved}")
-    if not (resolved / "vault").is_dir():
-        raise SystemExit(f"source missing vault/: {resolved}")
+    # vault/ is optional: a sharing-safe subgraph-export
+    # (--include-vault=none) produces a wiki-only tree. The merge driver
+    # treats every cited vault file as missing and tags the relevant
+    # source stubs `vault_missing: true` for hydrate-vault.
     return resolved
 
 
@@ -490,6 +492,30 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
                          f"{s.get('skipped', s.get('reason',''))}")
     L.append("")
 
+    missing = manifest.get("missing_vault", [])
+    if missing:
+        L.append("## Missing vault sources")
+        L.append("")
+        L.append(
+            f"{len(missing)} source stub(s) cite vault files that weren't "
+            "shipped (the publisher published notes-only or licensing "
+            "prevented bundling). Each is tagged `vault_missing: true` so "
+            "you and your agent can see them in the wiki UI. To re-acquire, "
+            "run:"
+        )
+        L.append("")
+        L.append(f"    uv run python3 <skill_path>/scripts/hydrate_vault.py "
+                 f"--origin {origin}")
+        L.append("")
+        for m in missing[:20]:
+            url = m.get("source_url") or "(no source_url recorded)"
+            lic = m.get("license") or "(license unknown)"
+            L.append(f"- `{m['page_rel']}` cites `{m['citation_rel']}` "
+                     f"→ {url}  ({lic})")
+        if len(missing) > 20:
+            L.append(f"- ... and {len(missing) - 20} more")
+        L.append("")
+
     L.append("## Manifest counts")
     L.append("")
     L.append(f"- wiki pages imported: {len(manifest['wiki_pages'])}")
@@ -526,6 +552,25 @@ def cmd_stage(args) -> int:
 
     src_wiki = source / "wiki"
     src_vault = source / "vault"
+    # Sharing-safe exports omit vault/ entirely; reconcile.* tolerate a
+    # non-existent dir by returning empty plans, and the missing-vault
+    # tagging pass below picks up every citation as `vault_missing`.
+
+    # Read source's export manifest if present. It records vault metadata
+    # even for files whose content was deliberately omitted by
+    # subgraph-export (sharing-safe default). We use it to mark
+    # vault_missing source stubs with full provenance so the receiving
+    # user (or hydrate-vault) knows where to re-acquire each source.
+    incoming_vault_meta: dict[str, dict] = {}
+    src_manifest_path = source / "_export-manifest.json"
+    if src_manifest_path.is_file():
+        try:
+            sm = json.loads(src_manifest_path.read_text())
+            for entry in sm.get("vault_metadata", []):
+                if entry.get("rel"):
+                    incoming_vault_meta[entry["rel"]] = entry
+        except (json.JSONDecodeError, OSError):
+            pass
 
     # 1. Vault reconciliation.
     receiver_index = reconcile.index_vault(workspace / "vault")
@@ -593,6 +638,64 @@ def cmd_stage(args) -> int:
             "sha256_at_import": reconcile.sha256_file(out_path),
         })
 
+    # 3b. Mark `vault_missing: true` on source stubs whose cited vault
+    # file isn't present in the staged or receiver vault. The receiving
+    # user (and hydrate_vault.py) needs provenance to re-acquire — pull
+    # source_url / source_type / sha256 from the incoming export manifest
+    # when available, and from the stub's own body otherwise.
+    receiver_vault_paths: set[str] = set(receiver_index.values())
+    staged_vault_paths: set[str] = {dst for _, dst in vault_plan["to_copy"]}
+    available_vault: set[str] = receiver_vault_paths | staged_vault_paths
+    missing_vault_marks: list[dict] = []
+
+    def _alias(rel: str) -> str:
+        return vault_plan["alias_map"].get(rel, rel)
+
+    for staged_dir in (staging["wiki_in"], staging["collisions"]):
+        for staged_page in staged_dir.rglob("*.md"):
+            text = staged_page.read_text(errors="replace")
+            page_fm, page_body = read_frontmatter(text)
+            if (page_fm.get("type") or "") != "source":
+                continue
+            broken_rels: list[str] = []
+            for m in CITATION_RE.finditer(page_body):
+                cite = m.group(1).strip()
+                final = _alias(cite)
+                if final not in available_vault:
+                    broken_rels.append(cite)
+            if not broken_rels:
+                continue
+            cite_rel = broken_rels[0]
+            meta = incoming_vault_meta.get(cite_rel, {})
+            mutated = text
+            mutated = set_frontmatter_field(mutated, "vault_missing", "true")
+            if meta.get("source_url") and not page_fm.get("source_url"):
+                mutated = set_frontmatter_field(
+                    mutated, "source_url", meta["source_url"]
+                )
+            if meta.get("source_type") and not page_fm.get("source_type"):
+                mutated = set_frontmatter_field(
+                    mutated, "source_type", meta["source_type"]
+                )
+            if meta.get("sha256"):
+                mutated = set_frontmatter_field(
+                    mutated, "vault_sha256", meta["sha256"]
+                )
+            if meta.get("license"):
+                mutated = set_frontmatter_field(
+                    mutated, "license", meta["license"]
+                )
+            staged_page.write_text(mutated)
+            missing_vault_marks.append({
+                "page_rel": str(staged_page.relative_to(staging["root"])),
+                "citation_rel": cite_rel,
+                "alias_rel": _alias(cite_rel),
+                "source_url": meta.get("source_url", ""),
+                "source_type": meta.get("source_type", ""),
+                "license": meta.get("license", ""),
+                "redistributable": meta.get("redistributable", False),
+            })
+
     # 4. Manifest record for vault.
     manifest_vault: list[dict] = []
     for src_rel, dst_rel in vault_plan["deduped"]:
@@ -636,6 +739,7 @@ def cmd_stage(args) -> int:
         ],
         "accepted_bridges": [],  # populated post-discover-bridges review
         "quarantines": quarantines,
+        "missing_vault": missing_vault_marks,
     }
     staging["apply_json"].write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"

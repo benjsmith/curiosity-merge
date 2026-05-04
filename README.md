@@ -2,11 +2,13 @@
 
 Sharing/federation layer for [curiosity-engine](https://github.com/benjsmith/curiosity-engine) wikis.
 
-Three verbs:
+Five verbs:
 
-- **`subgraph-export`** — extract a self-contained mini-wiki (project, page neighborhood, or origin) for sharing
-- **`discover-bridges`** — surface high-similarity page pairs that aren't yet wikilinked, within one wiki or across origins
-- **`merge`** — combine someone else's wiki into your own with full provenance, collision handling, and an untrusted-content trust model
+- **`subgraph-export`** — extract a self-contained mini-wiki (project, page neighborhood, or origin) for sharing. Defaults to bytes-free vault export (`--include-vault=none`); receivers re-hydrate with their own access. See `docs/licensing.md`.
+- **`discover-bridges`** + **`accept-bridges`** — surface high-similarity page pairs that aren't yet wikilinked; apply user-checked candidates and update merge manifests so unmerge can unwind.
+- **`merge`** — combine someone else's wiki into your own with full provenance, collision handling, untrusted-content framing, and `vault_missing: true` tagging for sources whose bytes weren't shipped.
+- **`unmerge`** — surgically undo a previous merge using the manifest + receiving wiki state. Three-bucket classification preserves user curation.
+- **`hydrate-vault`** — re-acquire missing sources tagged `vault_missing: true`. AlphaXiv-preferred for arXiv; per-category dispatch for preprints, open access, paywalled (manual), unknown.
 
 This is a separate skill (not part of curiosity-engine) because it ingests external data and has a different trust model and release cadence. Most curiosity-engine users don't need it; install when you want to share or absorb wikis.
 
@@ -60,13 +62,17 @@ curiosity-merge/
 ├── docs/
 │   ├── architecture.md
 │   ├── trust-model.md
+│   ├── licensing.md
 │   └── publishing.md
 ├── scripts/
 │   ├── setup.sh
 │   ├── subgraph_export.py
-│   ├── discover_bridges.py      # planned
-│   ├── merge.py                 # planned
-│   ├── reconcile.py             # planned
+│   ├── discover_bridges.py
+│   ├── accept_bridges.py
+│   ├── merge.py
+│   ├── unmerge.py
+│   ├── hydrate_vault.py
+│   ├── reconcile.py
 │   └── merge_evolve_guard.sh   # hash-guard (named distinctly from curiosity-engine's)
 └── template/
     └── prompts.md

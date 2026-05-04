@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
+import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -166,6 +168,93 @@ def _one_hop_neighbors(page: Path, all_pages: list[Path], wiki_dir: Path) -> lis
 # --- vault collection ------------------------------------------------------
 
 
+# Licenses + flags we treat as "owner has indicated this content is
+# redistributable". Conservative: defaults that aren't redistributable
+# (Elsevier, paywalled blogs, "all rights reserved") fail closed.
+_REDISTRIBUTABLE_LICENSES = {
+    "cc0", "public-domain", "publicdomain",
+    "cc-by", "cc-by-sa", "cc-by-nc", "cc-by-nd",
+    "cc-by-3.0", "cc-by-4.0", "cc-by-sa-3.0", "cc-by-sa-4.0",
+    "mit", "apache-2.0", "apache2", "bsd", "bsd-3-clause", "bsd-2-clause",
+    "arxiv-non-exclusive",  # arXiv's default license permits redistribution
+}
+
+
+_FM_KEY_RE = re.compile(r"^([a-z_][a-z0-9_]*):\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def _raw_frontmatter(text: str) -> dict[str, str]:
+    """Read frontmatter without curiosity-engine's ALLOWED_FM_KEYS filter.
+
+    We look at vault files' frontmatter for license/redistributable hints
+    that the curator's allowlist intentionally drops. Returns a flat
+    string-only dict; lists/multi-line values are joined for our purposes.
+    """
+    out: dict[str, str] = {}
+    if not text.startswith("---"):
+        return out
+    end = text.find("\n---", 3)
+    if end == -1:
+        return out
+    block = text[3:end].strip()
+    for line in block.splitlines():
+        if not line or line[0] in (" ", "\t"):
+            continue
+        m = _FM_KEY_RE.match(line)
+        if m:
+            key, val = m.group(1).strip().lower(), m.group(2).strip()
+            if val and val[0] in ('"', "'") and val[-1] == val[0]:
+                val = val[1:-1]
+            out[key] = val
+    return out
+
+
+def _vault_redistributable(text: str) -> bool:
+    fm = _raw_frontmatter(text)
+    redistrib = fm.get("redistributable", "").lower()
+    if redistrib in ("true", "yes", "1"):
+        return True
+    if redistrib in ("false", "no", "0"):
+        return False
+    license_str = fm.get("license", "").lower().strip()
+    if license_str in _REDISTRIBUTABLE_LICENSES:
+        return True
+    # arXiv URLs imply arXiv's non-exclusive license unless the author
+    # explicitly relicensed; we treat them as redistributable for
+    # subgraph-export purposes (the receiver still re-fetches by default).
+    src_url = fm.get("source_url", "").lower()
+    if "arxiv.org" in src_url or "biorxiv.org" in src_url or "chemrxiv.org" in src_url:
+        return True
+    return False
+
+
+def _vault_source_meta(path: Path) -> dict:
+    """Pull lightweight provenance from a vault file's frontmatter for
+    inclusion in the export manifest. Receivers use this to hydrate.
+    """
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return {}
+    fm = _raw_frontmatter(text)
+    return {
+        "source_url": fm.get("source_url", ""),
+        "source_path": fm.get("source_path", ""),
+        "source_type": fm.get("source_type", ""),
+        "title": fm.get("title", ""),
+        "license": fm.get("license", ""),
+        "redistributable": _vault_redistributable(text),
+    }
+
+
+def _sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _collect_cited_vault(scope_pages: list[Path], vault_dir: Path) -> list[Path]:
     """Resolve every (vault:<rel>) citation in scope pages to a vault file.
 
@@ -197,6 +286,25 @@ def _collect_cited_vault(scope_pages: list[Path], vault_dir: Path) -> list[Path]
             # don't paper over it — leave it missing for the audit.
             pass
     return out
+
+
+def _filter_vault_for_mode(vault_files: list[Path], mode: str) -> list[Path]:
+    """Apply --include-vault mode. Default `none` is sharing-safe."""
+    if mode == "none":
+        return []
+    if mode == "all":
+        return list(vault_files)
+    if mode == "owned":
+        out = []
+        for p in vault_files:
+            try:
+                text = p.read_text(errors="replace")
+            except OSError:
+                continue
+            if _vault_redistributable(text):
+                out.append(p)
+        return out
+    raise SystemExit(f"unknown --include-vault mode: {mode!r}")
 
 
 # --- copy + manifest -------------------------------------------------------
@@ -254,7 +362,16 @@ def _filter_projects_json(workspace: Path, dest_curator: Path,
 def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
                     include_1_hop: bool, origin_wiki: Path,
                     origin_label: str | None,
-                    scope_pages_rel: list[str], scope_vault_rel: list[str]) -> None:
+                    scope_pages_rel: list[str], scope_vault_rel: list[str],
+                    vault_metadata: list[dict],
+                    include_vault_mode: str) -> None:
+    """Write `_export-manifest.json`.
+
+    `vault_metadata` records every cited vault file regardless of whether
+    its content was included — sha256, source_url, source_type, license.
+    Receivers use this to hydrate missing sources after merge. Excluding
+    bytes but recording metadata is the licensing-safe default.
+    """
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "exported_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -265,8 +382,10 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
             "value": scope_value,
             "include_1_hop": include_1_hop,
         },
+        "include_vault_mode": include_vault_mode,
         "scope_pages": scope_pages_rel,
         "scope_vault": scope_vault_rel,
+        "vault_metadata": vault_metadata,
     }
     (dest / "_export-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -296,6 +415,16 @@ def main(argv: list[str] | None = None) -> int:
                     help="curiosity-engine workspace root (default: cwd)")
     ap.add_argument("--label", metavar="STR", default=None,
                     help="optional human label for origin_wiki in manifest")
+    ap.add_argument("--include-vault", choices=("none", "owned", "all"),
+                    default="none",
+                    help="which vault files to copy into the export "
+                         "(default: none — sharing-safe; the manifest still "
+                         "records sha256/source_url/license for every cited "
+                         "vault file so receivers can hydrate). 'owned' = "
+                         "files whose frontmatter declares a redistributable "
+                         "license or arXiv-family preprint URL. 'all' = "
+                         "include everything (only safe for personal "
+                         "transfer, not public sharing).")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing files at destination")
     args = ap.parse_args(argv)
@@ -331,7 +460,21 @@ def main(argv: list[str] | None = None) -> int:
         if home.is_file() and home not in scope_pages:
             scope_pages.append(home)
 
-    vault_files = _collect_cited_vault(scope_pages, vault_dir)
+    cited_vault_files = _collect_cited_vault(scope_pages, vault_dir)
+
+    # Build vault metadata (always recorded) BEFORE applying the
+    # include-vault filter, so the manifest captures the full citation
+    # graph even when bytes are omitted.
+    vault_metadata: list[dict] = []
+    for p in cited_vault_files:
+        rel = str(p.relative_to(vault_dir))
+        vault_metadata.append({
+            "rel": rel,
+            "sha256": _sha256(p),
+            **_vault_source_meta(p),
+        })
+
+    vault_files = _filter_vault_for_mode(cited_vault_files, args.include_vault)
 
     dest_wiki = dest / "wiki"
     dest_vault = dest / "vault"
@@ -363,12 +506,23 @@ def main(argv: list[str] | None = None) -> int:
         origin_label=args.label,
         scope_pages_rel=pages_rel,
         scope_vault_rel=vault_rel,
+        vault_metadata=vault_metadata,
+        include_vault_mode=args.include_vault,
     )
 
-    sys.stdout.write(
-        f"exported {len(pages_rel)} pages and {len(vault_rel)} vault files to {dest}\n"
+    omitted = len(vault_metadata) - len(vault_rel)
+    msg = (
+        f"exported {len(pages_rel)} pages and {len(vault_rel)} vault files "
+        f"to {dest}\n"
         f"manifest: {dest / '_export-manifest.json'}\n"
     )
+    if omitted > 0:
+        msg += (
+            f"note: {omitted} cited vault file(s) omitted "
+            f"(--include-vault={args.include_vault}); receivers can "
+            f"hydrate them via `hydrate_vault.py` after merge.\n"
+        )
+    sys.stdout.write(msg)
     return 0
 
 

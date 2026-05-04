@@ -137,6 +137,97 @@ A new architecture based on attention mechanisms.
 
 
 @pytest.fixture
+def wiki_a_with_paywalled(tmp_path: Path) -> Path:
+    """Variant of wiki_a with a mix of licensed sources for hydrate tests:
+    one arXiv preprint (redistributable), one Nature paper (paywalled),
+    one CC-BY blog post (open). Each cited from a wiki page.
+    """
+    root = tmp_path / "wiki-a-mixed"
+    (root / "wiki" / "concepts").mkdir(parents=True)
+    (root / "wiki" / "sources").mkdir(parents=True)
+    (root / "wiki" / "projects").mkdir(parents=True)
+    (root / "vault").mkdir(parents=True)
+    (root / ".curator").mkdir(parents=True)
+
+    _write(root / "wiki" / "projects" / "mixed.md", """\
+---
+title: Mixed Project
+type: project
+---
+
+Mixed-license sources.
+""")
+    _write(root / "wiki" / "concepts" / "topic-a.md", """\
+---
+title: Topic A
+type: concept
+projects: [mixed]
+---
+
+(vault:arxiv-paper.extracted.md) (vault:nature-paper.extracted.md) (vault:openblog.extracted.md)
+""")
+    _write(root / "wiki" / "sources" / "arxiv-paper.md", """\
+---
+title: "ArXiv Source"
+type: source
+projects: [mixed]
+source_url: https://arxiv.org/abs/1706.03762
+---
+
+(vault:arxiv-paper.extracted.md)
+""")
+    _write(root / "wiki" / "sources" / "nature-paper.md", """\
+---
+title: "Nature Source"
+type: source
+projects: [mixed]
+source_url: https://nature.com/articles/example
+---
+
+(vault:nature-paper.extracted.md)
+""")
+    _write(root / "wiki" / "sources" / "openblog.md", """\
+---
+title: "Open Blog"
+type: source
+projects: [mixed]
+source_url: https://example.org/blog
+---
+
+(vault:openblog.extracted.md)
+""")
+    # Vault files with explicit license markers.
+    _write(root / "vault" / "arxiv-paper.extracted.md", """\
+---
+title: "ArXiv Paper"
+source_url: https://arxiv.org/abs/1706.03762
+license: arxiv-non-exclusive
+---
+
+Body.
+""")
+    _write(root / "vault" / "nature-paper.extracted.md", """\
+---
+title: "Nature Paper"
+source_url: https://nature.com/articles/example
+license: all-rights-reserved
+---
+
+Body.
+""")
+    _write(root / "vault" / "openblog.extracted.md", """\
+---
+title: "Open Blog Post"
+source_url: https://example.org/blog
+license: CC-BY-4.0
+---
+
+Body.
+""")
+    return root
+
+
+@pytest.fixture
 def wiki_b(tmp_path: Path, wiki_a: Path) -> Path:
     """Source wiki. Generative-models project with a transformer page
     that collides with wiki-a's, plus a unique diffusion concept. Vault

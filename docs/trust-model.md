@@ -124,6 +124,20 @@ These tools are heavy: install, license, runtime. Forcing them on a default merg
 - **curiosity-engine's primitives.** `naming.read_frontmatter`, `sweep.wiki_pages`, etc. are imported and trusted to behave per their contracts. If they're compromised, this skill's defenses don't help — but that's the threat model of any plugin layered on top of trusted code.
 - **The user's own wiki.** `subgraph-export` operates on the user's own wiki; no untrusted-framing is added to outputs. The receiving end of someone else's `merge` is what does the framing.
 
+## Licensing and content provenance
+
+Separate from the threat model is the licensing question: most curiosity-engine vaults hold sources whose copyright belongs to publishers, not the user. Bundling those bytes into a public sub-wiki is a republishing problem, not a security problem — but it's still a problem.
+
+curiosity-merge treats this with the same fail-closed posture as the security defenses:
+
+- `subgraph_export.py --include-vault` defaults to `none`. Public sharing is the default sharing mode, and bundling no vault content is the only mode that's always safe.
+- The export manifest records every cited vault file's `sha256`, `source_url`, `source_type`, and `license` regardless of whether bytes ship. Receivers hydrate via `hydrate_vault.py`.
+- Mode `owned` bundles only files whose frontmatter declares a redistributable license OR whose `source_url` is on a recognized preprint server (arXiv, bioRxiv, chemRxiv, medRxiv). The matcher is conservative: anything unrecognized is excluded.
+- Source stubs whose vault files weren't shipped get tagged `vault_missing: true` at merge time, with provenance carried over from the publishing wiki's manifest. The receiving user and any agent reading the wiki sees the tag immediately. Nothing is silently dropped.
+- `hydrate-vault` never auto-fetches paywalled sources. It lists them with their URLs so the user can re-acquire via institutional access manually.
+
+See `docs/licensing.md` for the full model, recommended publishing patterns, and the per-category fetch strategies.
+
 ## What is out of scope
 
 - **Cryptographic provenance.** We don't sign wiki exports or verify signatures. A future feature could; for now, trust comes from "you knew the person you cloned from" and the audit report.

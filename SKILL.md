@@ -19,7 +19,18 @@ npx skills add -g -y benjsmith/curiosity-merge
 bash <skill_path>/scripts/setup.sh
 ```
 
-## The four verbs
+## Sharing and licensing — share notes, not sources
+
+Most curiosity-engine vaults hold sources whose copyright doesn't belong to the user (arXiv preprints, paywalled papers, copyrighted blogs). Notes written *on top of* those sources do. curiosity-merge separates them.
+
+`subgraph_export.py --include-vault {none,owned,all}` controls which vault files ride along:
+- `none` (default) — bytes-free export. Wiki pages ship; vault metadata (sha256, source_url, license) is recorded in the manifest; receivers hydrate. **Always safe for public sharing.**
+- `owned` — bundles only files whose frontmatter declares a redistributable license OR whose URL is on a preprint server (arXiv/bioRxiv/chemRxiv).
+- `all` — everything. Personal transfer only; not safe for public sharing.
+
+When a receiver merges, source stubs whose vault files weren't shipped get tagged `vault_missing: true` with provenance. `hydrate_vault.py` walks those stubs, categorizes by URL (arxiv / preprint / open_access / paywalled / unknown), and re-acquires what it can with per-source confirmation. AlphaXiv-preferred for arXiv when installed. See `docs/licensing.md`.
+
+## The five verbs
 
 ### `subgraph-export` — extract a self-contained mini-wiki
 
@@ -91,6 +102,27 @@ All work is staged to `.curator/.unmerge-staging/<origin>/`. The user reviews th
 
 **Cannot rely on the source wiki's remote.** The source may have been curated since you merged. The receiving wiki's own git history + the per-origin manifest is the only authoritative record of what came from the merge — and that's what unmerge uses.
 
+### `hydrate-vault` — re-acquire missing sources after a merge
+
+```
+uv run python3 <skill_path>/scripts/hydrate_vault.py --origin <name>
+uv run python3 <skill_path>/scripts/hydrate_vault.py --origin <name> --apply
+```
+
+Walks source stubs tagged `vault_missing: true`, categorizes by URL, and dispatches to a fetcher per category. Default is dry-run; `--apply` actually fetches. Per-source confirmation in interactive mode (or `--yes` to auto-accept). Successful fetches clear `vault_missing: true` from the stub.
+
+| Category | Strategy |
+|---|---|
+| `arxiv` | AlphaXiv-preferred if installed (clean pre-extracted markdown); falls back to PDF + curiosity-engine `local_ingest`. |
+| `biorxiv` / `chemrxiv` / `medrxiv` | PDF download + `local_ingest`. |
+| `open_access` | Direct fetch + `local_ingest`. |
+| `paywalled` | Listed for manual fetch via institutional access. Never auto-downloaded. |
+| `unknown` | Listed; manual handling required. |
+
+`--origin <name>` filters to stubs from that merge; without it, every `vault_missing` stub in the wiki is processed regardless of origin.
+
+If alphaxiv isn't installed and an arXiv source needed PDF fallback, the script can offer the install hint with `--offer-alphaxiv` (or you can skip it; the setup.sh prompt also offers).
+
 ## Trust model
 
 `merge` is the only verb that ingests external data, and that's where the trust model lives. The defenses are concrete:
@@ -138,9 +170,10 @@ See `docs/trust-model.md` for the full gate list, the rationale for opt-in defau
 
 | Verb | Status |
 |---|---|
-| `subgraph-export` | shipped — first release |
-| `discover-bridges` | next |
-| `merge` | after discover-bridges |
-| `unmerge` | last |
+| `subgraph-export` | shipped (v0.1) |
+| `discover-bridges` + `accept-bridges` | shipped (v0.1) |
+| `merge` (with vault-missing tagging) | shipped (v0.1, vault-missing v0.2) |
+| `unmerge` | shipped (v0.1) |
+| `hydrate-vault` | shipped (v0.2) |
 
 Each verb is independently shippable; `subgraph-export` is useful immediately even without the other two.

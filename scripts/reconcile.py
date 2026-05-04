@@ -102,6 +102,13 @@ def reconcile_vault(
     # with the same target rel-path can't both win.
     claimed_final: set[str] = set(receiver_index.values())
 
+    # Sharing-safe exports omit vault/ entirely. Treat that as "no
+    # incoming files" rather than raising — the merge driver's
+    # vault_missing tagging pass picks up every citation.
+    if not incoming_vault_dir.is_dir():
+        return {"alias_map": alias_map, "to_copy": to_copy,
+                "deduped": deduped, "renamed": renamed}
+
     for p in sorted(incoming_vault_dir.rglob("*")):
         if not p.is_file():
             continue

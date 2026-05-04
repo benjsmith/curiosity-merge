@@ -22,6 +22,7 @@ def test_subgraph_export_project_scope(wiki_a: Path, env_with_ce, tmp_path):
         "subgraph_export.py",
         "--project", "ml-foundations",
         "--to", str(out),
+        "--include-vault", "all",
         "--workspace", str(wiki_a),
         env=env_with_ce,
     )
@@ -34,8 +35,31 @@ def test_subgraph_export_project_scope(wiki_a: Path, env_with_ce, tmp_path):
     assert "concepts/transformer.md" in pages
     assert "concepts/attention.md" in pages
     assert "projects/ml-foundations.md" in pages
-    # Vault file came along via citation.
+    # With --include-vault=all, the cited file rides along.
     assert manifest["scope_vault"] == ["vaswani-2017-attention.extracted.md"]
+    # Metadata recorded regardless of mode.
+    assert manifest["vault_metadata"][0]["rel"] == \
+           "vaswani-2017-attention.extracted.md"
+
+
+def test_subgraph_export_default_is_bytes_free(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """Default --include-vault=none ships no vault content but records
+    metadata. This is the always-safe public-sharing default."""
+    out = tmp_path / "export-default"
+    run_script(
+        "subgraph_export.py",
+        "--project", "ml-foundations",
+        "--to", str(out),
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["include_vault_mode"] == "none"
+    assert manifest["scope_vault"] == []
+    # vault metadata still recorded for receiver hydration.
+    assert any(e["rel"] == "vaswani-2017-attention.extracted.md"
+               for e in manifest["vault_metadata"])
 
 
 def test_subgraph_export_rejects_destination_inside_workspace(
@@ -286,6 +310,159 @@ def test_accept_bridges_idempotent(wiki_a: Path, wiki_b: Path, env_with_ce):
     second = (wiki_a / "wiki" / "concepts" / "attention.md").read_text()
     assert first.count("[[diffusion]]") == 1
     assert second.count("[[diffusion]]") == 1
+
+
+# --- subgraph-export vault-sharing modes ----------------------------------
+
+
+def test_subgraph_export_default_omits_all_vault_records_metadata(
+        wiki_a_with_paywalled: Path, env_with_ce, tmp_path):
+    out = tmp_path / "exp-none"
+    run_script(
+        "subgraph_export.py",
+        "--project", "mixed",
+        "--to", str(out),
+        "--workspace", str(wiki_a_with_paywalled),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["include_vault_mode"] == "none"
+    # Bytes excluded.
+    assert manifest["scope_vault"] == []
+    assert not (out / "vault").exists() or not list((out / "vault").iterdir())
+    # Metadata recorded for every cited file.
+    rels = {e["rel"] for e in manifest["vault_metadata"]}
+    assert rels == {
+        "arxiv-paper.extracted.md",
+        "nature-paper.extracted.md",
+        "openblog.extracted.md",
+    }
+    # Redistributability assessed.
+    by_rel = {e["rel"]: e for e in manifest["vault_metadata"]}
+    assert by_rel["arxiv-paper.extracted.md"]["redistributable"] is True
+    assert by_rel["openblog.extracted.md"]["redistributable"] is True
+    assert by_rel["nature-paper.extracted.md"]["redistributable"] is False
+
+
+def test_subgraph_export_owned_includes_only_redistributable(
+        wiki_a_with_paywalled: Path, env_with_ce, tmp_path):
+    out = tmp_path / "exp-owned"
+    run_script(
+        "subgraph_export.py",
+        "--project", "mixed",
+        "--to", str(out),
+        "--include-vault", "owned",
+        "--workspace", str(wiki_a_with_paywalled),
+        env=env_with_ce,
+    )
+    bundled = sorted(p.name for p in (out / "vault").iterdir())
+    assert "arxiv-paper.extracted.md" in bundled
+    assert "openblog.extracted.md" in bundled
+    assert "nature-paper.extracted.md" not in bundled
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["include_vault_mode"] == "owned"
+
+
+def test_subgraph_export_all_includes_everything(
+        wiki_a_with_paywalled: Path, env_with_ce, tmp_path):
+    out = tmp_path / "exp-all"
+    run_script(
+        "subgraph_export.py",
+        "--project", "mixed",
+        "--to", str(out),
+        "--include-vault", "all",
+        "--workspace", str(wiki_a_with_paywalled),
+        env=env_with_ce,
+    )
+    bundled = sorted(p.name for p in (out / "vault").iterdir())
+    assert len(bundled) == 3
+
+
+# --- merge marks vault_missing -------------------------------------------
+
+
+def test_merge_marks_vault_missing_for_omitted_sources(
+        wiki_a_with_paywalled: Path, wiki_a: Path,
+        env_with_ce, tmp_path):
+    """Export wiki_a_with_paywalled with --include-vault=none, then merge
+    that export into a fresh receiving wiki. Source stubs should land
+    with vault_missing: true and source_url propagated.
+    """
+    export = tmp_path / "shared"
+    run_script(
+        "subgraph_export.py",
+        "--project", "mixed",
+        "--to", str(export),
+        "--workspace", str(wiki_a_with_paywalled),
+        env=env_with_ce,
+    )
+    # Use wiki_a as receiver (it has its own unrelated content).
+    run_script(
+        "merge.py", str(export), "--as-origin", "shared",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    staging = wiki_a / ".curator" / ".merge-staging" / "shared"
+    manifest = json.loads((staging / "apply.json").read_text())
+    missing_pages = {m["page_rel"] for m in manifest["missing_vault"]}
+    # All three source stubs were tagged because vault content was omitted.
+    assert any("arxiv-paper" in p for p in missing_pages)
+    assert any("nature-paper" in p for p in missing_pages)
+    assert any("openblog" in p for p in missing_pages)
+    # Inspect a staged source stub directly.
+    arxiv_stub = (staging / "wiki-incoming" / "sources" / "arxiv-paper.md").read_text()
+    assert "vault_missing: true" in arxiv_stub
+    assert "arxiv.org" in arxiv_stub  # source_url propagated
+
+
+# --- hydrate-vault categorization ----------------------------------------
+
+
+def test_hydrate_vault_dry_run_categorizes_correctly(
+        wiki_a_with_paywalled: Path, wiki_a: Path,
+        env_with_ce, tmp_path):
+    export = tmp_path / "shared2"
+    run_script(
+        "subgraph_export.py",
+        "--project", "mixed",
+        "--to", str(export),
+        "--workspace", str(wiki_a_with_paywalled),
+        env=env_with_ce,
+    )
+    run_script(
+        "merge.py", str(export), "--as-origin", "shared",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    run_script(
+        "merge.py", "--apply", "shared",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    res = run_script(
+        "hydrate_vault.py",
+        "--workspace", str(wiki_a),
+        "--origin", "shared",
+        env=env_with_ce,
+    )
+    out = res.stdout
+    # Each category surfaces with the right count.
+    assert "arxiv: 1" in out
+    assert "paywalled: 1" in out  # nature-paper
+    # openblog has CC-BY → open_access
+    assert "open_access: 1" in out
+    # Default is dry-run.
+    assert "dry run" in out
+
+
+def test_hydrate_vault_no_missing_returns_clean(
+        wiki_a: Path, env_with_ce):
+    res = run_script(
+        "hydrate_vault.py",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "no vault_missing stubs" in res.stdout
 
 
 # --- merge --rerun-gates --------------------------------------------------

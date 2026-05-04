@@ -138,7 +138,7 @@ fi
 # by the agent following the protocol in SKILL.md.
 echo ""
 echo "Allowlist patterns to add (host-specific install handled by your CLI):"
-for SCRIPT in subgraph_export.py discover_bridges.py merge.py reconcile.py; do
+for SCRIPT in subgraph_export.py discover_bridges.py accept_bridges.py merge.py unmerge.py reconcile.py hydrate_vault.py; do
     echo "  Bash(uv run python3 $SCRIPT_DIR_PHYSICAL/$SCRIPT:*)"
     if [ "$SCRIPT_DIR_LOGICAL" != "$SCRIPT_DIR_PHYSICAL" ]; then
         echo "  Bash(uv run python3 $SCRIPT_DIR_LOGICAL/$SCRIPT:*)"
@@ -156,3 +156,41 @@ echo "Next steps:"
 echo "  source $ENV_FILE                       # load env into current shell"
 echo "  uv run python3 $SCRIPT_DIR_PHYSICAL/subgraph_export.py --help"
 echo ""
+
+# Optional companion: alphaxiv. hydrate_vault.py prefers alphaxiv's
+# pre-extracted markdown for arXiv papers when re-acquiring sources
+# after a merge. Default off — installing extra skills is a deliberate
+# choice. Detect first; only offer when not already installed and only
+# in interactive sessions. Setup proceeds either way; this is purely
+# additive.
+_alphaxiv_installed=0
+for d in "$HOME/.claude/skills/alphaxiv" "$HOME/.agents/skills/alphaxiv"; do
+    if [ -d "$d" ]; then
+        _alphaxiv_installed=1
+        break
+    fi
+done
+
+if [ "$_alphaxiv_installed" -eq 0 ] && _is_interactive; then
+    echo "Optional: the alphaxiv skill produces clean, pre-extracted"
+    echo "markdown for arXiv papers. hydrate_vault.py will use it"
+    echo "automatically if installed (otherwise it falls back to PDF"
+    echo "download + pypdf, which is noisier)."
+    printf "Shall I install alphaxiv for you now? [y/N] "
+    read -r reply_alphaxiv || reply_alphaxiv="n"
+    case "$reply_alphaxiv" in
+        y|Y|yes|YES)
+            if command -v npx >/dev/null 2>&1; then
+                echo "  Installing benjsmith/alphaxiv via npx skills ..."
+                npx skills add -g -y benjsmith/alphaxiv \
+                    || echo "  (install failed — re-run later: npx skills add -g -y benjsmith/alphaxiv)"
+            else
+                echo "  npx not found. Install later: npx skills add -g -y benjsmith/alphaxiv"
+            fi
+            ;;
+        *)
+            echo "  Skipping alphaxiv. Install anytime: npx skills add -g -y benjsmith/alphaxiv"
+            ;;
+    esac
+    echo ""
+fi
