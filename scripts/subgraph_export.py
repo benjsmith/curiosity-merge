@@ -51,6 +51,11 @@ except ImportError as e:
     )
     sys.exit(2)
 
+# Local helpers — keep relative imports robust whether invoked via
+# uv run or as a module.
+sys.path.insert(0, str(Path(__file__).parent))
+import preflight  # type: ignore  # noqa: E402
+
 
 SCHEMA_VERSION = 1
 
@@ -364,7 +369,8 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
                     origin_label: str | None,
                     scope_pages_rel: list[str], scope_vault_rel: list[str],
                     vault_metadata: list[dict],
-                    include_vault_mode: str) -> None:
+                    include_vault_mode: str,
+                    preflight_findings: list[dict] | None = None) -> None:
     """Write `_export-manifest.json`.
 
     `vault_metadata` records every cited vault file regardless of whether
@@ -386,6 +392,7 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
         "scope_pages": scope_pages_rel,
         "scope_vault": scope_vault_rel,
         "vault_metadata": vault_metadata,
+        "preflight_findings": preflight_findings or [],
     }
     (dest / "_export-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
@@ -425,6 +432,28 @@ def main(argv: list[str] | None = None) -> int:
                          "license or arXiv-family preprint URL. 'all' = "
                          "include everything (only safe for personal "
                          "transfer, not public sharing).")
+    ap.add_argument("--include-non-native", action="store_true",
+                    help="ship pages whose `origin:` tag indicates they "
+                         "came from a previous merge (default: exclude — "
+                         "republishing someone else's content via your "
+                         "own subgraph-export is a chain-merge propagation "
+                         "risk).")
+    ap.add_argument("--keep-url-params", action="store_true",
+                    help="preserve query strings on source URLs in the "
+                         "manifest (default: strip them — signed S3 URLs, "
+                         "session tokens, and tracking parameters can leak "
+                         "data when published).")
+    ap.add_argument("--quote-density-threshold", type=float, default=0.25,
+                    help="warn when a wiki page is >= this fraction of "
+                         "block-quoted source text (default: 0.25)")
+    ap.add_argument("--yes", action="store_true",
+                    help="auto-accept preflight findings and proceed "
+                         "(non-interactive). Otherwise: prompt y/N when "
+                         "interactive, refuse when not.")
+    ap.add_argument("--strict", action="store_true",
+                    help="refuse to proceed if any preflight detector fires")
+    ap.add_argument("--no-preflight", action="store_true",
+                    help="skip all preflight checks (not recommended)")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing files at destination")
     args = ap.parse_args(argv)
@@ -460,21 +489,79 @@ def main(argv: list[str] | None = None) -> int:
         if home.is_file() and home not in scope_pages:
             scope_pages.append(home)
 
+    # Chain-merge defense: drop pages whose `origin:` tag indicates they
+    # came from a previous merge. The user can override with
+    # --include-non-native (e.g. for personal transfer where they
+    # genuinely own the rights to ship merged-in content).
+    if not args.include_non_native:
+        pre_count = len(scope_pages)
+        scope_pages = [
+            p for p in scope_pages
+            if not _raw_frontmatter(p.read_text(errors="replace")).get("origin")
+        ]
+        excluded = pre_count - len(scope_pages)
+        if excluded:
+            sys.stderr.write(
+                f"subgraph-export: excluded {excluded} non-native page(s) "
+                "(--include-non-native to override)\n"
+            )
+        if not scope_pages:
+            raise SystemExit(
+                "scope matched only non-native pages; nothing to export "
+                "(pass --include-non-native if you intend to ship them)"
+            )
+
     cited_vault_files = _collect_cited_vault(scope_pages, vault_dir)
 
     # Build vault metadata (always recorded) BEFORE applying the
     # include-vault filter, so the manifest captures the full citation
-    # graph even when bytes are omitted.
+    # graph even when bytes are omitted. Redact URL query strings unless
+    # --keep-url-params; signed URLs / session tokens / tracking params
+    # leak data when published.
     vault_metadata: list[dict] = []
     for p in cited_vault_files:
         rel = str(p.relative_to(vault_dir))
+        meta = _vault_source_meta(p)
+        if meta.get("source_url"):
+            meta["source_url"] = preflight.redact_url(
+                meta["source_url"], keep_params=args.keep_url_params
+            )
         vault_metadata.append({
             "rel": rel,
             "sha256": _sha256(p),
-            **_vault_source_meta(p),
+            **meta,
         })
 
     vault_files = _filter_vault_for_mode(cited_vault_files, args.include_vault)
+
+    # Pre-flight: run detectors on what we're about to ship. Surface any
+    # findings, prompt for confirmation. Strict mode refuses on any hit.
+    findings: list[dict] = []
+    if not args.no_preflight:
+        findings = preflight.run_all(
+            scope_pages=scope_pages,
+            vault_files=vault_files,  # only files that will actually ship
+            include_non_native=args.include_non_native,
+            quote_density_threshold=args.quote_density_threshold,
+        )
+        if findings:
+            sys.stderr.write(preflight.format_findings(findings))
+            if args.strict:
+                raise SystemExit(
+                    "preflight: --strict and findings present; refusing"
+                )
+            if not args.yes:
+                if not sys.stdin.isatty():
+                    raise SystemExit(
+                        "preflight: findings present and not interactive "
+                        "(no TTY). Pass --yes to auto-accept, --strict to "
+                        "refuse, or --no-preflight to skip checks."
+                    )
+                sys.stderr.write("Continue with export? [y/N] ")
+                sys.stderr.flush()
+                ans = (sys.stdin.readline() or "").strip().lower()
+                if ans not in ("y", "yes"):
+                    raise SystemExit("preflight: declined by user")
 
     dest_wiki = dest / "wiki"
     dest_vault = dest / "vault"
@@ -508,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
         scope_vault_rel=vault_rel,
         vault_metadata=vault_metadata,
         include_vault_mode=args.include_vault,
+        preflight_findings=findings,
     )
 
     omitted = len(vault_metadata) - len(vault_rel)

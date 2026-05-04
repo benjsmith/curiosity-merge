@@ -36,8 +36,17 @@ Sharing-safe defaults and licensing-aware merge.
 - `docs/trust-model.md` adds a Licensing/content provenance section connecting it to the security model.
 - `SKILL.md` and `README.md` now document five verbs and the share-notes-not-sources premise up front.
 
+### Pre-flight detectors (subgraph-export)
+- New `scripts/preflight.py` runs on every export before write. Each detector returns findings with plain-language rationale; user accepts (`--yes` or interactive `y`), refuses (`--strict`), or skips (`--no-preflight`). Findings recorded in the manifest under `preflight_findings`.
+- **non_native_page** — pages tagged `origin:` (previous merge) excluded by default; `--include-non-native` to override.
+- **quote_density** — pages where ≥25% of body is in `>` block quotes; threshold tunable via `--quote-density-threshold`.
+- **license_inconsistent** — vault file with declared open license but URL on a paywalled-publisher domain.
+- **gpl_contagion** — GPL/AGPL/LGPL markers in vault or wiki content; rationale explains copyleft propagation risk.
+- **gdpr_likely_pii** — emails, phones, SSN, IBAN, credit-card-like numbers; conservative filters (`@example.com`, low digit counts) to reduce noise; user verifies remaining matches.
+- **URL redaction** — `source_url` query strings stripped in manifest by default (signed URLs, tokens, `utm_*`); `--keep-url-params` to preserve.
+
 ### Tests
-- 19 pytest e2e tests (was 12). New coverage: each `--include-vault` mode, mixed-license source fixture (arxiv / Nature / CC-BY blog), merge tagging vault_missing with provenance, hydrate-vault categorization without network.
+- 47 pytest tests (was 12). New: 20 unit tests for each preflight detector (test_preflight.py); 8 integration tests for the new flags (--include-non-native, --keep-url-params, --strict, --no-preflight, --yes, non-interactive refusal); plus the prior 19 e2e tests.
 
 ## v0.1.0 — 2026-05-03
 

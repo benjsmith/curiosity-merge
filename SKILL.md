@@ -28,7 +28,9 @@ Most curiosity-engine vaults hold sources whose copyright doesn't belong to the 
 - `owned` — bundles only files whose frontmatter declares a redistributable license OR whose URL is on a preprint server (arXiv/bioRxiv/chemRxiv).
 - `all` — everything. Personal transfer only; not safe for public sharing.
 
-When a receiver merges, source stubs whose vault files weren't shipped get tagged `vault_missing: true` with provenance. `hydrate_vault.py` walks those stubs, categorizes by URL (arxiv / preprint / open_access / paywalled / unknown), and re-acquires what it can with per-source confirmation. AlphaXiv-preferred for arXiv when installed. See `docs/licensing.md`.
+When a receiver merges, source stubs whose vault files weren't shipped get tagged `vault_missing: true` with provenance. `hydrate_vault.py` walks those stubs, categorizes by URL (arxiv / preprint / open_access / paywalled / unknown), and re-acquires what it can with per-source confirmation. AlphaXiv-preferred for arXiv when installed.
+
+**Pre-flight detectors** run on every `subgraph-export` before write: chain-merge contamination (non-native pages excluded by default), quote-density lint, license-consistency check, GPL contagion, GDPR-likely PII, URL redaction. Each finding lands in the manifest with plain-language rationale; the user accepts (`--yes`), refuses (`--strict`), or skips (`--no-preflight`). See `docs/licensing.md` for the full table and override mechanism.
 
 ## The five verbs
 

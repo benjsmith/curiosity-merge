@@ -80,6 +80,23 @@ The fetched file's sha256 is compared against the manifest's recorded `vault_sha
 
 After successful hydration, the source stub's `vault_missing: true` flag is cleared.
 
+## Pre-flight checks
+
+`subgraph-export` runs a battery of detectors before write and surfaces findings with rationale. The user accepts (`--yes` or interactive `y`), refuses (`--strict` or interactive `N`), or skips (`--no-preflight`). Each finding lands in the export manifest under `preflight_findings` so receivers can see what was flagged.
+
+| Detector | What it catches | Default | Override |
+|---|---|---|---|
+| `non_native_page` | wiki pages whose `origin:` tag indicates they came from a previous merge — re-publishing them propagates someone else's content through your own export | excluded from scope | `--include-non-native` |
+| `quote_density` | wiki pages where ≥25% of body is inside `>` block quotes — likely reproducing publisher prose under thin transformative coverage | warn | `--quote-density-threshold 0.5` (or higher) |
+| `license_inconsistent` | vault files declaring an open license but with `source_url` on a paywalled-publisher domain — either the URL is mislabeled or the license tag is wrong | warn | review and fix the frontmatter |
+| `gpl_contagion` | vault or wiki pages containing GPL/AGPL/LGPL license markers — copyleft / share-alike requirements may oblige your published wiki to inherit GPL too | warn | re-license the published wiki, remove the content, or confirm fair-use exception |
+| `gdpr_likely_pii` | likely personal data (emails, phones, SSN, IBAN, credit-card-like numbers) in vault or wiki body | warn | redact, drop the source, or confirm the matches aren't real-person data |
+| `redact_url` | source URL query strings (signed S3, session tokens, `utm_*`) | redacted in manifest | `--keep-url-params` |
+
+The detectors are deliberately conservative — false positives are recoverable (user overrides), false negatives are not (a missed GDPR issue ships to the public). Expect the GDPR detector in particular to fire on technical content that contains `@example.com` (filtered) or quoted phone numbers (not filtered) — review and override when appropriate.
+
+The detectors do **not** replace legal review for high-stakes publishing. A wiki tightly built on commercial content benefits from a human read of the `preflight_findings` block before push.
+
 ## Recommendations for publishing wikis
 
 - **License your notes.** A short `LICENSE.md` in the published repo (CC-BY-4.0 is a common choice) tells receivers what they can do with your prose.

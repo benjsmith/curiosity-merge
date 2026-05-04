@@ -138,6 +138,19 @@ curiosity-merge treats this with the same fail-closed posture as the security de
 
 See `docs/licensing.md` for the full model, recommended publishing patterns, and the per-category fetch strategies.
 
+### Pre-flight detectors
+
+`subgraph-export` runs a pre-flight pass over the scope before write. Each detector surfaces findings with a plain-language rationale; the user accepts, refuses (`--strict`), or skips (`--no-preflight`). Findings land in `preflight_findings` in the manifest so receivers can see what was flagged at publish time. Detectors:
+
+- **non_native_page** — chain-merge contamination. Default-excluded; `--include-non-native` to override.
+- **quote_density** — wiki pages dominated by block-quoted source text (default threshold 25%). Fair-use signal, not a hard rule.
+- **license_inconsistent** — declared license disagrees with publisher domain.
+- **gpl_contagion** — GPL/AGPL/LGPL license markers; copyleft propagation risk for your published wiki.
+- **gdpr_likely_pii** — emails, phones, SSN, IBAN, payment-number patterns. False-positive heavy by design; the user verifies.
+- **URL redaction** — strip query strings from `source_url` in the manifest by default; `--keep-url-params` to preserve.
+
+These are heuristics, not legal review. They protect against the easy mistakes; they don't make a published wiki bulletproof.
+
 ## What is out of scope
 
 - **Cryptographic provenance.** We don't sign wiki exports or verify signatures. A future feature could; for now, trust comes from "you knew the person you cloned from" and the audit report.

@@ -312,6 +312,211 @@ def test_accept_bridges_idempotent(wiki_a: Path, wiki_b: Path, env_with_ce):
     assert second.count("[[diffusion]]") == 1
 
 
+# --- subgraph-export preflight integration -------------------------------
+
+
+def test_export_excludes_non_native_pages_by_default(
+        wiki_a: Path, wiki_b: Path, env_with_ce, tmp_path):
+    run_script("merge.py", str(wiki_b), "--as-origin", "bob",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    run_script("merge.py", "--apply", "bob",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    out = tmp_path / "exp"
+    run_script(
+        "subgraph_export.py",
+        "--project", "ml-foundations",
+        "--to", str(out),
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    for rel in manifest["scope_pages"]:
+        text = (out / "wiki" / rel).read_text()
+        assert "origin: bob" not in text
+
+
+def test_export_with_include_non_native_keeps_origin_pages(
+        wiki_a: Path, wiki_b: Path, env_with_ce, tmp_path):
+    run_script("merge.py", str(wiki_b), "--as-origin", "bob",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    run_script("merge.py", "--apply", "bob",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    out = tmp_path / "exp-bob"
+    run_script(
+        "subgraph_export.py",
+        "--project", "generative-models",
+        "--to", str(out),
+        "--include-non-native",
+        "--yes",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["scope_pages"]
+
+
+def test_export_strips_url_query_by_default(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\nhome\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n(vault:s.md)\n"
+    )
+    (ws / "vault" / "s.md").write_text(
+        "---\ntitle: S\nsource_url: https://example.com/p?session=abc&utm_source=tw\n"
+        "license: CC-BY-4.0\n---\nbody\n"
+    )
+    out = tmp_path / "exp-redact"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    urls = [m.get("source_url", "") for m in manifest["vault_metadata"]]
+    assert "https://example.com/p" in urls
+    assert all("session=" not in u for u in urls)
+
+
+def test_export_keep_url_params_preserves_everything(
+        env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-keep"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n(vault:s.md)\n"
+    )
+    (ws / "vault" / "s.md").write_text(
+        "---\ntitle: S\nsource_url: https://example.com/p?token=abc\n"
+        "license: CC-BY-4.0\n---\n"
+    )
+    out = tmp_path / "exp-keep"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--keep-url-params",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    urls = [m.get("source_url", "") for m in manifest["vault_metadata"]]
+    assert any("token=abc" in u for u in urls)
+
+
+def test_export_strict_refuses_when_findings_present(
+        env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-strict"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        + "> heavy quote line for fair use review\n" * 30
+    )
+    out = tmp_path / "exp-strict"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--strict",
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "preflight" in (res.stderr + res.stdout).lower()
+
+
+def test_export_no_preflight_skips_checks(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-skip"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        + "> heavy quote\n" * 30
+    )
+    out = tmp_path / "exp-skip"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--no-preflight",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["preflight_findings"] == []
+
+
+def test_export_yes_in_noninteractive_proceeds_with_findings(
+        env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-yes"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        + "> heavy\n" * 30
+    )
+    out = tmp_path / "exp-yes"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--yes",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["preflight_findings"]
+    assert any(f["kind"] == "quote_density"
+               for f in manifest["preflight_findings"])
+
+
+def test_export_noninteractive_without_yes_refuses_on_findings(
+        env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-refuse"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        + "> q\n" * 30
+    )
+    out = tmp_path / "exp-refuse"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+
+
 # --- subgraph-export vault-sharing modes ----------------------------------
 
 
