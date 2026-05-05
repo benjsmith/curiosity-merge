@@ -521,6 +521,26 @@ def main(argv: list[str] | None = None) -> int:
                          "(default: counts only — published manifests should "
                          "not name files that tripped GDPR/PII detection or "
                          "they become a harvesting oracle)")
+    ap.add_argument("--enable-presidio", action="store_true",
+                    help="use Microsoft Presidio (local NER + ML) for PII "
+                         "detection instead of the regex baseline. Adds "
+                         "PERSON / LOCATION / driver-license / passport / "
+                         "NRP entity types. Requires `pip install "
+                         "presidio-analyzer` + spaCy model. All analysis "
+                         "runs locally; no content leaves the machine.")
+    ap.add_argument("--presidio-entities", default="",
+                    help="comma-separated entity types to detect with "
+                         "Presidio (default: curated PII set; see "
+                         "presidio_gate.DEFAULT_ENTITIES). Use this to add "
+                         "ORGANIZATION/DATE_TIME or restrict the list.")
+    ap.add_argument("--presidio-confidence", type=float, default=0.6,
+                    help="Presidio score threshold (default: 0.6 — same as "
+                         "Presidio's own analyzer default)")
+    ap.add_argument("--no-preflight-cache", action="store_true",
+                    help="bypass the per-file Presidio result cache "
+                         "(default: cache stored at "
+                         ".curator/.preflight-cache/, keyed by file "
+                         "sha256 + entity-list + confidence)")
     ap.add_argument("--allow-license-class", default="",
                     help="comma-separated license-class tokens to re-include "
                          "in --include-vault=owned (default: empty). Use "
@@ -626,11 +646,22 @@ def main(argv: list[str] | None = None) -> int:
     # require deliberate confirmation.
     findings: list[dict] = []
     if not args.no_preflight:
+        presidio_entities = (
+            tuple(e.strip() for e in args.presidio_entities.split(",")
+                  if e.strip())
+            if args.presidio_entities else None
+        )
+        cache_dir = (None if args.no_preflight_cache
+                     else workspace / ".curator" / ".preflight-cache")
         findings = preflight.run_all(
             scope_pages=scope_pages,
             vault_files=vault_files,  # only files that will actually ship
             include_non_native=args.include_non_native,
             quote_density_threshold=args.quote_density_threshold,
+            enable_presidio=args.enable_presidio,
+            presidio_entities=presidio_entities,
+            presidio_confidence=args.presidio_confidence,
+            cache_dir=cache_dir,
         )
         info_findings = [f for f in findings if f.get("severity") == "info"]
         warn_findings = [f for f in findings

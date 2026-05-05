@@ -30,7 +30,11 @@ Most curiosity-engine vaults hold sources whose copyright doesn't belong to the 
 
 When a receiver merges, source stubs whose vault files weren't shipped get tagged `vault_missing: true` with provenance. `hydrate_vault.py` walks those stubs, categorizes by URL (arxiv / preprint / open_access / paywalled / unknown), and re-acquires what it can with per-source confirmation. AlphaXiv-preferred for arXiv when installed.
 
-**Pre-flight detectors** run on every `subgraph-export` before write: chain-merge contamination (non-native pages excluded by default), quote-density lint, license-consistency check, GPL contagion, GDPR-likely PII, URL redaction. Each finding lands in the manifest with plain-language rationale; the user accepts (`--yes`), refuses (`--strict`), or skips (`--no-preflight`). See `docs/licensing.md` for the full table and override mechanism.
+**Pre-flight detectors** run on every `subgraph-export` before write: chain-merge contamination (non-native pages excluded by default), quote-density lint, license-consistency check, GPL contagion, GDPR-likely PII (regex+density baseline), URL redaction. Each finding has a `severity` (`info`/`warn`/`block`); info-only findings proceed without prompt, warn/block prompt for confirmation. The user accepts (`--yes`), refuses (`--strict`), or skips (`--no-preflight`).
+
+**Optional `--enable-presidio`** (v0.3.0+): Microsoft Presidio's local NER+ML pass replaces the regex GDPR detector. Catches PERSON names, LOCATION, structured IDs (driver license, passport, medical license), and GDPR special-category data (NRP). All analysis local; no content leaves the machine. Install: `uv pip install presidio-analyzer && uv run python -m spacy download en_core_web_lg` (~500MB; `setup.sh` offers this prompt). Per-file result cache at `.curator/.preflight-cache/`.
+
+See `docs/licensing.md` for the full table, manifest-safety contract, density rules, and Presidio reference.
 
 ## The five verbs
 

@@ -194,3 +194,56 @@ if [ "$_alphaxiv_installed" -eq 0 ] && _is_interactive; then
     esac
     echo ""
 fi
+
+# Optional companion: Microsoft Presidio. Adds NER + ML-based PII
+# detection on top of the regex baseline. Catches named-entity PII
+# (PERSON names, addresses, structured IDs) that regex can't see.
+# Default off — Presidio + spaCy model is ~500MB on disk and the model
+# download requires a network connection. setup.sh proceeds either way.
+#
+# Self-leak note for the curious: Presidio's default analyzer uses
+# spaCy NER + offline custom recognizers. All analysis runs locally;
+# no content leaves the machine. Documented in docs/licensing.md.
+_presidio_marker="$WORKSPACE_DIR/.curator/.presidio-prompted"
+if [ ! -f "$_presidio_marker" ] && _is_interactive; then
+    if uv run python -c "import presidio_analyzer" >/dev/null 2>&1; then
+        # already installed
+        :
+    else
+        echo "Optional: Microsoft Presidio adds NER + ML-based PII detection"
+        echo "  to subgraph-export and merge preflight. Catches named-entity"
+        echo "  PII (PERSON, LOCATION, addresses, structured IDs) that the"
+        echo "  regex baseline can't see. Runs entirely locally."
+        echo ""
+        echo "  Cost: ~500MB disk (Presidio + spaCy en_core_web_lg model)."
+        echo "  Network needed once for model download."
+        printf "Install Presidio now? [y/N] "
+        read -r reply_presidio || reply_presidio="n"
+        case "$reply_presidio" in
+            y|Y|yes|YES)
+                echo "  Installing presidio-analyzer ..."
+                if uv pip install presidio-analyzer >/dev/null 2>&1; then
+                    echo "  Downloading spaCy en_core_web_lg model ..."
+                    if uv run python -m spacy download en_core_web_lg >/dev/null 2>&1; then
+                        echo "  Done. Use --enable-presidio on subgraph_export.py / merge.py."
+                    else
+                        echo "  Model download failed. Run later:"
+                        echo "    uv run python -m spacy download en_core_web_lg"
+                    fi
+                else
+                    echo "  Install failed. Run later:"
+                    echo "    uv pip install presidio-analyzer"
+                    echo "    uv run python -m spacy download en_core_web_lg"
+                fi
+                ;;
+            *)
+                echo "  Skipping Presidio. Install anytime:"
+                echo "    uv pip install presidio-analyzer"
+                echo "    uv run python -m spacy download en_core_web_lg"
+                ;;
+        esac
+        echo ""
+    fi
+    # Touch marker so we don't re-prompt on every setup.sh re-run.
+    touch "$_presidio_marker" 2>/dev/null || true
+fi

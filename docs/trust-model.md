@@ -151,6 +151,16 @@ See `docs/licensing.md` for the full model, recommended publishing patterns, and
 
 These are heuristics, not legal review. They protect against the easy mistakes; they don't make a published wiki bulletproof.
 
+### Optional Presidio integration (v0.3.0)
+
+`--enable-presidio` substitutes Microsoft Presidio's NER + ML pass for the regex GDPR detector. Catches named-entity PII (PERSON, LOCATION), structured IDs the regex doesn't cover (driver license, passport, medical license), and GDPR special-category data (NRP — nationality/religion/political group). Requires a one-time install (~500MB) of `presidio-analyzer` plus the spaCy `en_core_web_lg` model.
+
+**Self-leak guarantee.** Presidio runs on the local machine. We initialize the AnalyzerEngine without any cloud recognizers. No content leaves the workspace during analysis. This is the architectural reason we chose Presidio over an LLM-API approach — asking an external LLM "is this private?" sends the very content the user is trying not to leak.
+
+Severity rules mirror the regex baseline (density-scaled for relaxable entities inside FETCHED markers; always-warn for structured IDs and outside markers). File-level severity remains the max across kinds.
+
+See `docs/licensing.md` for the full Presidio reference (entity list, install command, caching, score threshold, limitations).
+
 ## What is out of scope
 
 - **Cryptographic provenance.** We don't sign wiki exports or verify signatures. A future feature could; for now, trust comes from "you knew the person you cloned from" and the audit report.

@@ -46,6 +46,8 @@ shown locally only, never written to the published artifact.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import sys
@@ -673,13 +675,24 @@ def find_gdpr_likely_pii(files: list[Path]) -> list[dict]:
 
 def run_all(*, scope_pages: list[Path], vault_files: list[Path],
             include_non_native: bool = False,
-            quote_density_threshold: float = 0.25) -> list[dict]:
+            quote_density_threshold: float = 0.25,
+            enable_presidio: bool = False,
+            presidio_entities: tuple[str, ...] | list[str] | None = None,
+            presidio_confidence: float = 0.6,
+            cache_dir: Path | None = None) -> list[dict]:
     """Convenience: run every detector and return a flat findings list.
 
     `include_non_native=True` suppresses the chain-merge finding for
     callers that legitimately ship non-native content (personal
     transfer, or merge-stage preflight where everything is foreign by
     definition).
+
+    `enable_presidio=True` (v0.3.0) runs Microsoft Presidio's NER+ML
+    pass *instead of* the regex GDPR detector — Presidio covers the
+    same kinds (email, phone, SSN, IBAN, CC) plus richer entities
+    (PERSON, LOCATION, driver license, passport, NRP). Skipping the
+    regex detector when Presidio is on avoids double-counting; if
+    Presidio isn't installed, the regex detector runs as fallback.
     """
     findings: list[dict] = []
     if not include_non_native:
@@ -689,8 +702,126 @@ def run_all(*, scope_pages: list[Path], vault_files: list[Path],
     findings.extend(check_license_consistency(vault_files))
     targets = list(scope_pages) + list(vault_files)
     findings.extend(find_gpl_contagion(targets))
-    findings.extend(find_gdpr_likely_pii(targets))
+
+    presidio_used = False
+    if enable_presidio:
+        # Local import to avoid import-time spaCy load when not needed.
+        sys.path.insert(0, str(Path(__file__).parent))
+        import presidio_gate  # type: ignore
+        available, reason = presidio_gate.is_available()
+        if available:
+            entities = (presidio_entities
+                        if presidio_entities is not None
+                        else presidio_gate.DEFAULT_ENTITIES)
+            findings.extend(_run_presidio_with_cache(
+                presidio_gate, targets,
+                entities=tuple(entities),
+                confidence=presidio_confidence,
+                cache_dir=cache_dir,
+            ))
+            presidio_used = True
+        else:
+            sys.stderr.write(
+                f"preflight: --enable-presidio set but unavailable "
+                f"({reason}). Falling back to regex GDPR detector.\n"
+            )
+
+    if not presidio_used:
+        # Regex baseline. Stays as the always-available fallback.
+        findings.extend(find_gdpr_likely_pii(targets))
+
     return findings
+
+
+# --- presidio caching helper ---------------------------------------------
+
+
+def _file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    try:
+        with path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _run_presidio_with_cache(presidio_gate_mod, targets: list[Path],
+                              *, entities: tuple[str, ...],
+                              confidence: float,
+                              cache_dir: Path | None) -> list[dict]:
+    """Run Presidio per file with optional per-file result caching.
+
+    Cache key is (file sha256, entity-list+confidence hash). Cache value
+    is a manifest-safe finding (or sentinel for "no findings"). Samples
+    are NEVER cached — they're discarded after the local terminal sees
+    them, and the cache must not become a side-channel for them. On
+    cache hit, the per-file finding has empty `samples`.
+
+    If `cache_dir` is None, no caching; just analyze every file.
+    """
+    if cache_dir is None:
+        return presidio_gate_mod.analyze_files(
+            targets, entities=entities, confidence=confidence,
+        )
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cfg_hash = presidio_gate_mod.cache_config_hash(entities, confidence)
+
+    cached: list[dict] = []
+    to_analyze: list[Path] = []
+    cache_paths: dict[Path, Path] = {}
+
+    for p in targets:
+        sha = _file_sha256(p)
+        if not sha:
+            to_analyze.append(p)
+            continue
+        cache_path = cache_dir / f"{sha}-{cfg_hash}.json"
+        cache_paths[p] = cache_path
+        if cache_path.is_file():
+            try:
+                payload = json.loads(cache_path.read_text())
+                if payload.get("found"):
+                    # Hydrate as a finding with empty samples (cache
+                    # never stores samples; rationale + summary are
+                    # safe and stable).
+                    cached.append({**payload["finding"], "samples": []})
+                # else: cached miss, no finding to add
+                continue
+            except (json.JSONDecodeError, OSError):
+                pass  # corrupt cache → re-analyze
+        to_analyze.append(p)
+
+    if to_analyze:
+        fresh = presidio_gate_mod.analyze_files(
+            to_analyze, entities=entities, confidence=confidence,
+        )
+    else:
+        fresh = []
+    fresh_by_subject = {f["subject"]: f for f in fresh}
+
+    # Write cache entries for every analyzed file (hit and miss alike).
+    for p in to_analyze:
+        cache_path = cache_paths.get(p)
+        if cache_path is None:
+            continue
+        finding = fresh_by_subject.get(str(p))
+        if finding:
+            payload = {
+                "found": True,
+                "finding": {k: v for k, v in finding.items()
+                             if k != "samples"},
+            }
+        else:
+            payload = {"found": False}
+        try:
+            cache_path.write_text(json.dumps(payload) + "\n")
+        except OSError:
+            pass  # cache write failures are non-fatal
+
+    return cached + fresh
 
 
 # --- manifest projection -------------------------------------------------

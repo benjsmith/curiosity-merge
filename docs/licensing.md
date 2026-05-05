@@ -133,7 +133,38 @@ Why density: an arXiv paper's corresponding-author block (~5–20 emails per 50K
 
 **Info-only findings don't gate.** Severity-aware UX: info-only findings produce a one-line stderr acknowledgement and proceed. Warn/block findings prompt for confirmation interactively, refuse in non-interactive mode without `--yes`, refuse always under `--strict`. This means the typical academic export flows through without interruption while real concerns still require deliberate confirmation.
 
-**Limitations.** This is a regex+density heuristic. It catches structured PII patterns; it does not catch named-entity PII ("John Smith, born 3/12/1985, lives at 123 Main St"), inferred PII (combined-data risk), or context-sensitive disambiguation (a paper that *quotes* an example email vs *publishes* a contact email). A future opt-in gate (`--enable-presidio`, planned for v0.2.2) will add Microsoft Presidio's local NER+ML pass for these gaps.
+**Limitations of the regex baseline.** It catches structured PII patterns; it does not catch named-entity PII ("John Smith, born 3/12/1985, lives at 123 Main St"), inferred PII (combined-data risk), or context-sensitive disambiguation (a paper that *quotes* an example email vs *publishes* a contact email). For these cases use the optional Presidio gate below.
+
+### Optional Presidio gate (v0.3.0)
+
+`subgraph_export.py` and `merge.py` accept `--enable-presidio`. When set, **[Microsoft Presidio](https://github.com/microsoft/presidio)** replaces the regex GDPR detector with NER + ML-based PII detection. Catches named entities (PERSON, LOCATION, ORGANIZATION), structured IDs the regex baseline doesn't have (`US_DRIVER_LICENSE`, `US_PASSPORT`, `MEDICAL_LICENSE`, `IP_ADDRESS`), and sensitive demographics (`NRP` — nationality/religious/political group, GDPR Article 9 special-category data).
+
+**Install** (one-time, ~500MB disk + network for spaCy model):
+
+```
+uv pip install presidio-analyzer
+uv run python -m spacy download en_core_web_lg
+```
+
+`setup.sh` offers this as a y/N prompt. Skip and install later anytime.
+
+**Self-leak guarantee.** Presidio's default analyzer uses spaCy NER + offline custom recognizers. **All analysis runs on the local machine; no content leaves it.** We initialize the AnalyzerEngine without any cloud-backed recognizers. This contrasts with a hypothetical (deferred) `--enable-llm-pii-scan` flag that would call an external API — we avoid that path because asking a third-party LLM "is this private?" sends the very content the user is trying not to leak.
+
+**Default entity list:** `PERSON`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `US_SSN`, `IBAN_CODE`, `CREDIT_CARD`, `MEDICAL_LICENSE`, `US_DRIVER_LICENSE`, `US_PASSPORT`, `IP_ADDRESS`, `NRP`, `LOCATION`. Excluded by default: `ORGANIZATION` (every paper mentions Google/MIT/Stanford), `DATE_TIME` (every paper has a date), `URL` (we redact separately). Override via `--presidio-entities`.
+
+**Severity rules** mirror the regex detector:
+
+- Outside FETCHED markers → always WARN.
+- Inside markers, structured IDs (`US_SSN`, `IBAN_CODE`, `CREDIT_CARD`, `MEDICAL_LICENSE`, `US_DRIVER_LICENSE`, `US_PASSPORT`) → always WARN.
+- Inside markers, density-relaxable kinds (`PERSON`, `EMAIL_ADDRESS`, `PHONE_NUMBER`, `LOCATION`, `IP_ADDRESS`, `NRP`) → density-scaled (sparse → INFO, dense → WARN).
+
+This is essential: every academic paper has author PERSON entities. Without density relaxation, every paper would fire warn-level findings — same UX disaster as v0.2.1's email problem, just for names.
+
+**Caching.** First Presidio run loads the spaCy model (~3–5s) and analyzes every file (~500–2000ms each). Subsequent runs hit a per-file cache at `.curator/.preflight-cache/<sha256>-<config-hash>.json` — unchanged files cost ~0ms. Cache stores manifest-safe findings only (no samples, ever — verified by tests). `--no-preflight-cache` to bypass.
+
+**Score threshold.** Default 0.6. Tune via `--presidio-confidence`.
+
+**Limitations of Presidio.** English-only by default (the included `en_core_web_lg` model). Non-English content gets poor NER. Doesn't catch *combined-data* inference ("Dr. Alice Johnson, age 42, treats patients at MGH" — each fragment benign; combined, identifies a specific healthcare worker). Doesn't disambiguate quoted vs published context. NER models update over time; your finding counts may shift between Presidio releases.
 
 ### Payment-card detection scope
 

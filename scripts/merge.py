@@ -100,6 +100,19 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="enable all optional security/quality gates")
     ap.add_argument("--quality-threshold", type=int, default=60,
                     help="lint score floor for --enable-quality-lint (0-100)")
+    # Pre-flight (PII / licensing) gate flags. The receiving end runs
+    # the same preflight detectors over staged incoming content, with
+    # the same Presidio opt-in available.
+    ap.add_argument("--enable-presidio", action="store_true",
+                    help="use Presidio for PII detection on staged content "
+                         "instead of the regex baseline (see subgraph-export "
+                         "for the full rationale)")
+    ap.add_argument("--presidio-entities", default="",
+                    help="comma-separated Presidio entity types")
+    ap.add_argument("--presidio-confidence", type=float, default=0.6,
+                    help="Presidio score threshold (default 0.6)")
+    ap.add_argument("--no-preflight-cache", action="store_true",
+                    help="bypass per-file Presidio result cache")
     return ap
 
 
@@ -770,10 +783,21 @@ def cmd_stage(args) -> int:
     ) else []
     staged_vault = [p for p in staging["vault_in"].rglob("*")
                      if p.is_file()] if staging["vault_in"].is_dir() else []
+    presidio_entities = (
+        tuple(e.strip() for e in args.presidio_entities.split(",")
+              if e.strip())
+        if args.presidio_entities else None
+    )
+    cache_dir = (None if args.no_preflight_cache
+                 else workspace / ".curator" / ".preflight-cache")
     preflight_findings = preflight.run_all(
         scope_pages=staged_pages,
         vault_files=staged_vault,
         include_non_native=True,
+        enable_presidio=args.enable_presidio,
+        presidio_entities=presidio_entities,
+        presidio_confidence=args.presidio_confidence,
+        cache_dir=cache_dir,
     )
     preflight_findings_safe = [preflight.manifest_safe(f)
                                 for f in preflight_findings]

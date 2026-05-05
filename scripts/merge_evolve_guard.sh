@@ -34,6 +34,7 @@ GUARDED=(
     "$SCRIPT_DIR/reconcile.py"
     "$SCRIPT_DIR/hydrate_vault.py"
     "$SCRIPT_DIR/preflight.py"
+    "$SCRIPT_DIR/presidio_gate.py"
 )
 
 sha256_cmd() {

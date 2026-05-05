@@ -1,5 +1,87 @@
 # Changelog
 
+## v0.3.0 — 2026-05-05
+
+Optional Microsoft Presidio integration for ML-based PII detection
+beyond what regex+density can catch.
+
+### What's new
+
+- **`--enable-presidio` flag** on `subgraph_export.py` and `merge.py`.
+  When set (and Presidio is installed), substitutes Microsoft Presidio
+  for the regex GDPR detector. Catches PERSON names, LOCATION,
+  structured IDs (`US_DRIVER_LICENSE`, `US_PASSPORT`, `MEDICAL_LICENSE`,
+  `IP_ADDRESS`), and GDPR special-category data (`NRP` — nationality,
+  religion, political group).
+- **`scripts/presidio_gate.py`** — soft-import wrapper. If
+  `presidio-analyzer` isn't installed (default), the gate logs `skipped`
+  and the regex baseline runs as fallback. AnalyzerEngine is cached at
+  module level (3–5s load amortized across all files in one run).
+- **Curated default entity list** (`presidio_gate.DEFAULT_ENTITIES`):
+  PERSON, EMAIL_ADDRESS, PHONE_NUMBER, US_SSN, IBAN_CODE, CREDIT_CARD,
+  MEDICAL_LICENSE, US_DRIVER_LICENSE, US_PASSPORT, IP_ADDRESS, NRP,
+  LOCATION. Excluded by default: ORGANIZATION, DATE_TIME, URL (too
+  noisy on academic content / already redacted separately). Override
+  via `--presidio-entities`.
+- **Density-aware severity for Presidio findings**, mirroring the regex
+  detector. Outside FETCHED markers → warn. Inside markers, structured
+  IDs → warn. Inside markers, relaxable entities (PERSON, EMAIL, PHONE,
+  LOCATION, IP, NRP) → sparse=info, dense=warn at the same 0.5/1000
+  threshold. Without this, every academic paper would fire warn-level
+  PERSON findings on author names — the same UX disaster v0.2.1 had
+  with author emails.
+- **Per-file result cache** at `.curator/.preflight-cache/`. Keyed by
+  `(file sha256, entity-list + confidence hash)`. Manifest-safe entries
+  only (no samples ever — enforced by test). Bypass via
+  `--no-preflight-cache`.
+
+### Self-leak guarantee
+
+Presidio's default analyzer uses spaCy NER + offline custom recognizers.
+The AnalyzerEngine is initialized without any cloud-backed recognizers.
+**All analysis runs on the local machine; no content leaves it.** This
+is why we chose Presidio over an LLM-API approach: asking a third-party
+LLM "is this private?" sends the very content the user is trying not to
+leak. (`--enable-llm-pii-scan` is deliberately *not* in this release.)
+
+### setup.sh
+
+- New post-setup y/N: install Presidio + spaCy `en_core_web_lg` model.
+  Default off; explicit disk (~500MB) and network callouts. Marker file
+  prevents re-prompts. Two-step install with failure-tolerant messages
+  (pip can fail; model download can fail; either path leaves a useful
+  manual-install hint).
+
+### Documentation
+
+- `docs/licensing.md` — new "Optional Presidio gate" section: install
+  instructions, entity list, severity rules, self-leak guarantee,
+  caching behaviour, limitations (English-only, no combined-data
+  inference, no quote-vs-published disambiguation).
+- `docs/trust-model.md` cross-references the self-leak architecture.
+
+### Tests
+
+- 81 active + 4 skip-when-Presidio-absent tests (was 73).
+- New: soft-import path (engine unavailable → regex fallback);
+  cache hit skips re-analysis; cache invalidates on entity-list /
+  confidence change; cache disabled when `cache_dir=None`; samples
+  never persisted to cache files; cache config hash is order-
+  insensitive.
+- Real Presidio integration tests: PERSON in user content → warn;
+  PERSON in fetched/sparse author block → info; manifest_safe strips
+  sample entity values; "via Presidio" attribution in summaries.
+
+### Limitations
+
+- English-only (the bundled `en_core_web_lg` model). Non-English content
+  gets poor NER; documented.
+- Doesn't catch combined-data inference ("PERSON + LOCATION + DOB" as
+  a quasi-identifier). Could be added in a future release as a
+  Presidio post-processor.
+- Doesn't disambiguate quoted-as-example vs published-as-contact. The
+  density relaxation is the closest current proxy.
+
 ## v0.2.2 — 2026-05-05
 
 PII detection now distinguishes between content the user typed and

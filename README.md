@@ -73,6 +73,8 @@ curiosity-merge/
 │   ├── unmerge.py
 │   ├── hydrate_vault.py
 │   ├── reconcile.py
+│   ├── preflight.py            # detectors (chain-merge, quote-density, license, GPL, regex PII)
+│   ├── presidio_gate.py        # optional Presidio NER+ML PII detector (v0.3.0)
 │   └── merge_evolve_guard.sh   # hash-guard (named distinctly from curiosity-engine's)
 └── template/
     └── prompts.md
