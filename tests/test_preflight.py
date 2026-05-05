@@ -209,6 +209,153 @@ def test_gdpr_pii_reserved_test_domains_filtered(tmp_path: Path):
     assert preflight.find_gdpr_likely_pii([f]) == []
 
 
+# --- fetched-content density (v0.2.1.1) ----------------------------------
+
+
+def _wrap_fetched(body: str) -> str:
+    return (
+        "---\nsource_url: x\n---\n\n"
+        "<!-- BEGIN FETCHED CONTENT -->\n\n"
+        + body
+        + "\n\n<!-- END FETCHED CONTENT -->\n"
+    )
+
+
+def test_pii_in_fetched_sparse_is_info(tmp_path: Path):
+    """Academic-paper-shaped: 8 emails in 50K chars of fetched content
+    → density 0.16/1000 → info."""
+    body = ("Authors: avaswani@google.com noam@google.com nikip@google.com "
+            "usz@google.com llion@google.com aidan@cs.toronto.edu "
+            "lukaszkaiser@google.com illia.polosukhin@gmail.com\n\n"
+            "Abstract: " + ("padding text " * 4500))
+    f = _w(tmp_path / "paper.md", _wrap_fetched(body))
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "info"
+    assert "sparse" in findings[0]["summary"]
+    assert "author/contact block" in findings[0]["summary"]
+
+
+def test_pii_in_fetched_dense_is_warn(tmp_path: Path):
+    """Database-dump-shaped: 1000 emails in 100K chars → density 10/1000
+    → warn."""
+    rows = "\n".join(
+        f"row{i},customer{i}@somecompany.com,more padding"
+        for i in range(1000)
+    )
+    f = _w(tmp_path / "dump.md", _wrap_fetched(rows))
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "warn"
+    assert "dense" in findings[0]["summary"]
+
+
+def test_pii_in_fetched_short_doc_is_warn(tmp_path: Path):
+    """< 2000-char fetched region → density math suppressed, treated as
+    warn. A short extract with one email shouldn't get a free pass."""
+    body = "Tiny extract. Contact alice@somecompany.com."
+    f = _w(tmp_path / "short.md", _wrap_fetched(body))
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "warn"
+
+
+def test_pii_outside_fetched_is_warn(tmp_path: Path):
+    """User notes ABOVE the FETCHED block are user-typed → warn even
+    when the fetched body is clean."""
+    text = (
+        "---\nt: x\n---\n\n"
+        "My private contact: alice@privateaddress.com\n\n"
+        "<!-- BEGIN FETCHED CONTENT -->\n"
+        + ("Clean paper text. " * 500)
+        + "\n<!-- END FETCHED CONTENT -->\n"
+    )
+    f = _w(tmp_path / "user-above.md", text)
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "warn"
+
+
+def test_ssn_in_fetched_always_warn(tmp_path: Path):
+    """SSN/IBAN/payment-card stay warn even inside FETCHED markers,
+    regardless of density. They have no legitimate published form."""
+    big_body = ("padding text " * 1000) + "\nSSN 123-45-6789\n" + (
+        "more padding " * 1000
+    )
+    f = _w(tmp_path / "ssn.md", _wrap_fetched(big_body))
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "warn"
+    assert "SSN" in findings[0]["summary"]
+
+
+def test_iban_in_fetched_always_warn(tmp_path: Path):
+    big_body = ("padding " * 2000) + "\nIBAN DE89370400440532013000\n"
+    f = _w(tmp_path / "iban.md", _wrap_fetched(big_body))
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "warn"
+    assert "IBAN" in findings[0]["summary"]
+
+
+def test_file_severity_is_max_across_kinds(tmp_path: Path):
+    """A paper with sparse author emails (info) plus one IBAN (warn)
+    lands as warn — file-level severity = max."""
+    body = ("Authors: a@uni.edu b@uni.edu c@uni.edu d@uni.edu e@uni.edu\n\n"
+            + ("padding text " * 4000)
+            + "\nReference IBAN DE89370400440532013000\n")
+    f = _w(tmp_path / "mixed.md", _wrap_fetched(body))
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "warn"  # IBAN dominates
+    # Both kinds reported in summary.
+    assert "email" in findings[0]["summary"]
+    assert "IBAN" in findings[0]["summary"]
+
+
+def test_malformed_markers_treated_conservatively(tmp_path: Path):
+    """BEGIN without END → can't trust the fetched-region split → scan
+    everything as user content (warn) rather than info."""
+    text = (
+        "---\nt: x\n---\n\n"
+        "<!-- BEGIN FETCHED CONTENT -->\n"
+        "alice@somecompany.com bob@othercompany.com\n"
+        # no END marker
+    )
+    f = _w(tmp_path / "bad.md", text)
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["severity"] == "warn"
+
+
+def test_split_fetched_user_handles_multiple_blocks(tmp_path: Path):
+    """Multiple FETCHED blocks in one file: concat fetched parts; user
+    parts are everything else."""
+    text = (
+        "---\nt: x\n---\n\n"
+        "First user note.\n"
+        "<!-- BEGIN FETCHED CONTENT -->\nfetched 1\n<!-- END FETCHED CONTENT -->\n"
+        "Second user note.\n"
+        "<!-- BEGIN FETCHED CONTENT -->\nfetched 2\n<!-- END FETCHED CONTENT -->\n"
+        "Trailing user note.\n"
+    )
+    fetched, user = preflight._split_fetched_user(text)
+    assert "fetched 1" in fetched
+    assert "fetched 2" in fetched
+    assert "First user note" in user
+    assert "Second user note" in user
+    assert "Trailing user note" in user
+    assert "fetched 1" not in user
+    assert "fetched 2" not in user
+
+
+def test_clean_fetched_content_no_findings(tmp_path: Path):
+    """Paper with no PII at all → no findings."""
+    f = _w(tmp_path / "clean.md",
+           _wrap_fetched("Abstract. " + ("Lorem ipsum " * 500)))
+    assert preflight.find_gdpr_likely_pii([f]) == []
+
+
 # --- manifest-safety projection ------------------------------------------
 
 

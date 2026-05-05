@@ -523,6 +523,125 @@ def test_export_noninteractive_without_yes_refuses_on_findings(
     assert res.returncode != 0
 
 
+# --- info-only findings don't gate export (v0.2.1.1) ---------------------
+
+
+def _build_arxiv_like_fixture(ws: Path) -> None:
+    """A wiki with one vault file shaped like an arXiv extraction:
+    sparse author-block emails inside FETCHED CONTENT markers. Should
+    produce only info-severity findings."""
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        "(vault:paper.extracted.md)\n"
+    )
+    body = (
+        "Authors: avaswani@google.com noam@google.com nikip@google.com "
+        "usz@google.com llion@google.com aidan@cs.toronto.edu "
+        "lukaszkaiser@google.com illia.polosukhin@gmail.com\n\n"
+        "Abstract: " + ("padding text " * 4500)
+    )
+    (ws / "vault" / "paper.extracted.md").write_text(
+        "---\ntitle: Paper\nsource_url: https://arxiv.org/abs/1706.03762\n"
+        "license: arxiv-non-exclusive\n---\n\n"
+        "<!-- BEGIN FETCHED CONTENT -->\n\n"
+        + body
+        + "\n\n<!-- END FETCHED CONTENT -->\n"
+    )
+
+
+def test_arxiv_like_export_proceeds_without_yes_in_noninteractive(
+        env_with_ce, tmp_path: Path):
+    """v0.2.1.1: an arXiv-style extraction (sparse author emails inside
+    FETCHED markers) yields only info findings, which don't require
+    --yes in a non-interactive subprocess. v0.2.1 would have refused."""
+    ws = tmp_path / "ws-arxiv"
+    _build_arxiv_like_fixture(ws)
+    out = tmp_path / "exp-arxiv"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p",
+        "--include-vault", "owned",
+        "--to", str(out),
+        "--workspace", str(ws),
+        env=env_with_ce,
+        # NO --yes flag — non-interactive subprocess. Should succeed
+        # because findings are info-only.
+    )
+    # Stderr should mention info-level findings.
+    assert "info-level finding" in res.stderr
+    # Manifest should record the info-severity count.
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    summary = manifest["preflight_summary"]
+    pii_entries = [s for s in summary if s["kind"] == "gdpr_likely_pii"]
+    assert pii_entries, "expected PII entry in summary"
+    assert all(e["severity"] == "info" for e in pii_entries)
+
+
+def test_arxiv_like_export_strict_does_not_refuse_on_info(
+        env_with_ce, tmp_path: Path):
+    """--strict refuses on warn/block but allows info-only findings."""
+    ws = tmp_path / "ws-arxiv-strict"
+    _build_arxiv_like_fixture(ws)
+    out = tmp_path / "exp-arxiv-strict"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p",
+        "--include-vault", "owned",
+        "--to", str(out),
+        "--strict",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    # Export should have succeeded — manifest exists.
+    assert (out / "_export-manifest.json").is_file()
+
+
+def test_dense_pii_export_still_refuses_in_noninteractive(
+        env_with_ce, tmp_path: Path):
+    """Conversely, a DB-dump-shaped vault file produces warn findings,
+    which still refuse without --yes in non-interactive."""
+    ws = tmp_path / "ws-dump"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        "(vault:dump.extracted.md)\n"
+    )
+    rows = "\n".join(
+        f"row{i},customer{i}@somecompany.com,more padding text"
+        for i in range(1000)
+    )
+    (ws / "vault" / "dump.extracted.md").write_text(
+        "---\ntitle: Dump\nsource_url: https://example.org/leak\n"
+        "license: arxiv-non-exclusive\n---\n\n"
+        "<!-- BEGIN FETCHED CONTENT -->\n" + rows
+        + "\n<!-- END FETCHED CONTENT -->\n"
+    )
+    out = tmp_path / "exp-dump"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p",
+        "--include-vault", "owned",
+        "--to", str(out),
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "warn/block findings" in (res.stderr + res.stdout)
+
+
 # --- manifest must never leak PII (v0.2.1 regression test) ---------------
 
 

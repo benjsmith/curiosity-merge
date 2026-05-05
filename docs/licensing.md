@@ -114,6 +114,27 @@ Only **E.164 international format** (`+` prefix, 8–15 digits, optional spaces/
 
 Broad enough for RFC 6531 internationalised addresses (`José@example.org`, `用户@邮件.中国`). RFC 6761 reserved test domains and TLDs (`example.com`, `example.org`, `example.net`, `localhost`, `*.test`, `*.example`, `*.invalid`, `*.localhost`, `*.local`) are filtered out automatically.
 
+### Density-aware severity for academic content
+
+Vault extractions (created by curiosity-engine's `local_ingest.py`) wrap the source body in `<!-- BEGIN FETCHED CONTENT --> ... <!-- END FETCHED CONTENT -->` markers. Email/phone matches inside those markers are scaled by **density** (matches per 1000 chars):
+
+| Region | Match kind | Severity rule |
+|---|---|---|
+| Outside FETCHED markers (user-typed) | any kind | always **warn** |
+| Inside FETCHED markers | SSN / IBAN / payment-card-shaped | always **warn** (no legitimate published form) |
+| Inside FETCHED markers | email / phone, density ≤ 0.5/1000 chars | **info** (looks like author/contact block) |
+| Inside FETCHED markers | email / phone, density > 0.5/1000 chars | **warn** (looks like a directory or DB dump) |
+
+Below 2000 chars of fetched content, the density math is suppressed and any match is warn — short extracts don't get a free pass on a noisy ratio.
+
+Why density: an arXiv paper's corresponding-author block (~5–20 emails per 50K-char body, density ~0.1–0.4/1000) is published-by-consent contact information. A leaked customer database (1000+ emails per 100K, density ~10/1000) is the worst case. The density threshold is two orders of magnitude away from both, so the separator is robust. Without this, every academic vault extraction would dominate findings with benign author-block emails — training users to hit `--yes` and missing real concerns.
+
+**File-level severity = max across kinds.** A paper with sparse author emails (info) plus one IBAN (warn) lands as warn — the IBAN dominates.
+
+**Info-only findings don't gate.** Severity-aware UX: info-only findings produce a one-line stderr acknowledgement and proceed. Warn/block findings prompt for confirmation interactively, refuse in non-interactive mode without `--yes`, refuse always under `--strict`. This means the typical academic export flows through without interruption while real concerns still require deliberate confirmation.
+
+**Limitations.** This is a regex+density heuristic. It catches structured PII patterns; it does not catch named-entity PII ("John Smith, born 3/12/1985, lives at 123 Main St"), inferred PII (combined-data risk), or context-sensitive disambiguation (a paper that *quotes* an example email vs *publishes* a contact email). A future opt-in gate (`--enable-presidio`, planned for v0.2.2) will add Microsoft Presidio's local NER+ML pass for these gaps.
+
 ### Payment-card detection scope
 
 The detector fires only on digit strings *shaped like* a card number — used to **flag possible-PII**, not to process payments. This skill never accepts, transmits, or stores payment data. The regex requires a real issuer prefix (Visa `4`, Mastercard `51-55`, Amex `34`/`37`, Discover `6011`/`65xx`); ISBN-13 numbers (which start with `978`/`979`) and other long numeric identifiers don't match.

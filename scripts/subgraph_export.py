@@ -611,8 +611,19 @@ def main(argv: list[str] | None = None) -> int:
         cited_vault_files, args.include_vault, allowlist=license_allowlist
     )
 
-    # Pre-flight: run detectors on what we're about to ship. Surface any
-    # findings, prompt for confirmation. Strict mode refuses on any hit.
+    # Pre-flight: run detectors on what we're about to ship.
+    #
+    # Severity-aware UX (v0.2.1.1):
+    #   - info-only findings  → one-line stderr ack, no prompt, proceed
+    #     (typical for academic content with sparse author-block emails)
+    #   - warn / block        → show full findings, prompt y/N (or refuse
+    #                            in --strict / non-interactive without --yes)
+    #
+    # Why: density-aware GDPR detection produces a lot of info-level hits
+    # on real academic vault content (corresponding-author emails inside
+    # FETCHED CONTENT markers). Those are published-by-consent and should
+    # not interrupt the export flow. Real concerns (warn/block) still
+    # require deliberate confirmation.
     findings: list[dict] = []
     if not args.no_preflight:
         findings = preflight.run_all(
@@ -621,18 +632,31 @@ def main(argv: list[str] | None = None) -> int:
             include_non_native=args.include_non_native,
             quote_density_threshold=args.quote_density_threshold,
         )
-        if findings:
-            sys.stderr.write(preflight.format_findings(findings))
+        info_findings = [f for f in findings if f.get("severity") == "info"]
+        warn_findings = [f for f in findings
+                          if f.get("severity") in ("warn", "block")]
+
+        if info_findings:
+            sys.stderr.write(
+                f"preflight: {len(info_findings)} info-level finding(s) "
+                "(typical for academic content with sparse author-block "
+                "emails — not flagged for review)\n"
+            )
+
+        if warn_findings:
+            sys.stderr.write(preflight.format_findings(warn_findings))
             if args.strict:
                 raise SystemExit(
-                    "preflight: --strict and findings present; refusing"
+                    "preflight: --strict and warn/block findings present; "
+                    "refusing"
                 )
             if not args.yes:
                 if not sys.stdin.isatty():
                     raise SystemExit(
-                        "preflight: findings present and not interactive "
-                        "(no TTY). Pass --yes to auto-accept, --strict to "
-                        "refuse, or --no-preflight to skip checks."
+                        "preflight: warn/block findings present and not "
+                        "interactive (no TTY). Pass --yes to auto-accept, "
+                        "--strict to refuse, or --no-preflight to skip "
+                        "checks."
                     )
                 sys.stderr.write("Continue with export? [y/N] ")
                 sys.stderr.flush()

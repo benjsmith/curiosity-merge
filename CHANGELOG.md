@@ -1,5 +1,63 @@
 # Changelog
 
+## v0.2.2 — 2026-05-05
+
+PII detection now distinguishes between content the user typed and
+content that came from a published source. Academic vault extractions
+no longer dominate findings with benign author-block emails.
+
+### Density-aware FETCHED-content severity
+
+- The PII detector splits each scanned body into "fetched" (inside
+  `<!-- BEGIN FETCHED CONTENT --> ... <!-- END FETCHED CONTENT -->`
+  markers, written by curiosity-engine's local_ingest.py) and "user"
+  (everything else, including frontmatter and prose above/below
+  markers) regions.
+- Severity rules:
+  - Outside FETCHED markers: any PII match → **warn** (user-typed
+    content gets close scrutiny).
+  - Inside FETCHED markers, SSN/IBAN/payment-card-shaped: always
+    **warn** (no legitimate published form even in a paper).
+  - Inside FETCHED markers, email/phone: **density-scaled**.
+    Threshold 0.5 matches per 1000 chars. Below → **info** (looks
+    like author/contact block); above → **warn** (looks like a
+    directory or DB dump). Floor of 2000 chars below which density
+    math is suppressed and matches are warn.
+- File-level severity = max across kinds, so a paper with sparse
+  author emails (info) plus one IBAN (warn) lands as warn.
+- Malformed FETCHED markers (BEGIN without END, mismatched counts) →
+  scan everything as user content. Better to over-flag than under-
+  flag tampered structure.
+
+### Severity-aware export gating
+
+- **Info-only findings no longer gate.** v0.2.1 refused on any
+  finding in non-interactive mode; v0.2.1.1 emits a single-line
+  stderr acknowledgement ("12 info-level finding(s) — typical for
+  academic content; not flagged for review") and proceeds.
+- Warn/block findings still prompt interactively, refuse in
+  non-interactive mode without `--yes`, and refuse always under
+  `--strict`.
+
+### Why this matters
+
+Real arXiv extraction (8 corresponding-author emails in 50K-char
+body) was a v0.2.1 nightmare: every academic vault file produced a
+warn-level finding, every export prompted, users were trained to hit
+`--yes` reflexively. Density math separates A-class (papers, ~0.2
+emails/1000 chars) from B-class (DB dumps, ≥5 emails/1000 chars) by
+two orders of magnitude — the cleanest principled signal we found
+without going to ML/NER (deferred to v0.2.2's planned Presidio gate).
+
+### Tests
+
+- 73 tests passing (was 60). 13 new: density math at sparse/dense/
+  short-doc/multi-block scenarios; SSN/IBAN inside markers stay warn;
+  user-region emails outside markers are warn even when fetched body
+  is clean; malformed markers; file-level severity = max; info-only
+  export proceeds without `--yes` in non-interactive subprocess;
+  `--strict` allows info-only; dense PII still refuses.
+
 ## v0.2.1 — 2026-05-05
 
 Tighten the v0.2.0 pre-flight detectors after a critical review surfaced

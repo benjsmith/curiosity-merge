@@ -101,6 +101,58 @@ def _fenced_blocks(body: str) -> list[str]:
     return _FENCE_RE.findall(body)
 
 
+# curiosity-engine's local_ingest.py wraps every vault extraction in
+# `<!-- BEGIN FETCHED CONTENT --> ... <!-- END FETCHED CONTENT -->`. Text
+# inside is the publisher's content (paper body, archived blog, etc.);
+# text outside is the user's own provenance frontmatter, plus any notes
+# they typed above or below the fetched block.
+#
+# The PII detector treats these regions asymmetrically (see
+# `find_gdpr_likely_pii`): email/phone in fetched regions get density-
+# scaled severity (a paper's author block is sparse → info; a leaked DB
+# is dense → warn), while user regions are always warn (anything the
+# user typed deserves close scrutiny). SSN/IBAN/payment-card detectors
+# stay warn everywhere — those have no legitimate published form even
+# inside an extraction.
+_FETCHED_BLOCK_RE = re.compile(
+    r"<!--\s*BEGIN FETCHED CONTENT\b.*?-->"
+    r"(?P<inner>[\s\S]*?)"
+    r"<!--\s*END FETCHED CONTENT\b.*?-->",
+    re.MULTILINE,
+)
+
+
+def _split_fetched_user(text: str) -> tuple[str, str]:
+    """Return (fetched_concat, user_concat) regions of body text.
+
+    `fetched_concat` is every region inside FETCHED CONTENT markers,
+    concatenated. `user_concat` is everything else (the body with
+    fetched regions excised, plus the frontmatter — frontmatter is
+    user-provenance, not source content).
+
+    Malformed markers (BEGIN without END) cause us to *skip the
+    fetched-region split entirely* and treat the whole body as user
+    content. Better to over-flag than under-flag if the structure
+    looks tampered with.
+    """
+    body_text = _body(text)
+    # Reject malformed: count BEGIN vs END markers.
+    begins = len(re.findall(r"<!--\s*BEGIN FETCHED CONTENT", body_text))
+    ends = len(re.findall(r"<!--\s*END FETCHED CONTENT", body_text))
+    if begins != ends:
+        return "", body_text
+
+    fetched_parts: list[str] = []
+    user_parts: list[str] = []
+    last_end = 0
+    for m in _FETCHED_BLOCK_RE.finditer(body_text):
+        user_parts.append(body_text[last_end:m.start()])
+        fetched_parts.append(m.group("inner"))
+        last_end = m.end()
+    user_parts.append(body_text[last_end:])
+    return "\n".join(fetched_parts), "\n".join(user_parts)
+
+
 # --- 1. chain-merge detection -------------------------------------------
 
 
@@ -449,81 +501,167 @@ def _digit_count(s: str) -> int:
     return sum(1 for c in s if c.isdigit())
 
 
+# Density threshold: matches per character. Above this, content looks
+# like a directory/dump rather than an author/contact block.
+#
+# Calibration (v0.2.1):
+#   - Standard 50K-char arXiv paper, 8 corresponding emails: 0.16/1000
+#   - Big-collab 100K paper, 20 emails: 0.20/1000
+#   - Conference TOC, 50 emails in 10K chars: 5.0/1000
+#   - Leaked DB, 5000 emails in 100K chars: 50/1000
+# 0.5/1000 sits comfortably between A-class (~0.2) and B-class (>=5).
+_DENSITY_THRESHOLD_PER_CHAR = 0.5 / 1000.0
+# Below this region length, density math is too noisy to trust — treat
+# any match conservatively (warn). Prevents a 200-char extract with one
+# email from getting a free pass via the density quirk.
+_DENSITY_FLOOR_CHARS = 2000
+
+
+def _is_dense(match_count: int, region_len: int) -> bool:
+    if region_len < _DENSITY_FLOOR_CHARS:
+        return True  # short region → conservative
+    return (match_count / region_len) > _DENSITY_THRESHOLD_PER_CHAR
+
+
+def _gdpr_scan_region(region: str) -> dict:
+    """Run the per-region scans. Returns counts + samples per kind.
+    Strips emails before phone scan so `+1` in `user+1@x.com` doesn't
+    double-count.
+    """
+    emails = [m.group(0) for m in _EMAIL_RE.finditer(region)
+               if not _is_test_email(m.group(0))]
+    region_no_emails = _EMAIL_RE.sub("", region)
+    phones = [m.group(0) for m in _PHONE_E164_RE.finditer(region_no_emails)]
+    ssns = [m.group(0) for m in _SSN_RE.finditer(region)]
+    ibans = [m.group(0) for m in _IBAN_RE.finditer(region)]
+    ccs = [m.group(0) for m in _CC_RE.finditer(region)
+            if _digit_count(m.group(0)) >= 13]
+    return {
+        "email": emails, "phone": phones,
+        "ssn": ssns, "iban": ibans, "cc": ccs,
+    }
+
+
 def find_gdpr_likely_pii(files: list[Path]) -> list[dict]:
     """Scan body text for patterns that may be personal data.
 
-    Coverage in v0.2.1:
-      - email   (RFC 6531-compatible local-part + domain; reserved
-                 test domains filtered)
+    Detection categories (v0.2.1.1):
+      - email   (RFC 6531-compatible local-part + domain;
+                 reserved test domains filtered)
       - phone   (E.164 only — `+` prefix, 8–15 digits)
       - SSN     (US format ddd-dd-dddd)
       - IBAN    (international bank account number)
-      - cc      (credit-card-shaped 13–19 digit sequences)
+      - cc      (digit string SHAPED LIKE a payment card — used to
+                 flag possible-PII; this skill never accepts/processes
+                 card data)
 
-    False-positive rate: low for SSN/IBAN, low for email after reserved-
-    domain filtering, low for E.164 phone, moderate for cc (Luhn check
-    would help; not implemented). False-negative rate: high for
-    non-E.164 phone numbers (out of scope), and for free-text PII
-    (names + addresses) which would need NER.
+    Severity model (new in v0.2.1.1 — fetched-content density awareness):
+
+      Outside FETCHED CONTENT markers (user-typed content):
+        Any match → WARN (always).
+
+      Inside FETCHED CONTENT markers (publisher's text):
+        SSN / IBAN / cc           → WARN (no legitimate published form)
+        email / phone, dense      → WARN (looks like a directory/dump)
+        email / phone, sparse     → INFO (looks like author/contact
+                                          block in an academic paper)
+
+    `dense` = (matches / region_len) > 0.5 per 1000 chars, with a
+    2000-char floor below which we treat anything as dense (short
+    regions don't get a free pass on a noisy ratio).
+
+    Severity at the file level is the MAX across kinds — a paper with
+    sparse author emails (info) plus one IBAN (warn) lands as warn.
+
+    Why this design: an arXiv paper's corresponding-author block is
+    published-by-consent and shows up on every academic vault file. A
+    blanket "skip inside FETCHED markers" would produce 100% false-
+    negative rate on actual leaks; a blanket "scan everywhere" produces
+    100% noise rate on academic content. Density is the principled
+    separator that lines up with the underlying privacy intuition (a
+    handful of contact emails ≠ a directory dump).
     """
     out: list[dict] = []
     for p in files:
         try:
-            text = _body(p.read_text(errors="replace"))
+            text = p.read_text(errors="replace")
         except OSError:
             continue
+        fetched, user = _split_fetched_user(text)
 
-        emails = [m.group(0) for m in _EMAIL_RE.finditer(text)
-                   if not _is_test_email(m.group(0))]
-        # Strip emails before phone scan so `+1` in `user+1@x.com` doesn't
-        # double-count.
-        text_no_emails = _EMAIL_RE.sub("", text)
-        phones = [m.group(0) for m in _PHONE_E164_RE.finditer(text_no_emails)]
-        ssns = [m.group(0) for m in _SSN_RE.finditer(text)]
-        ibans = [m.group(0) for m in _IBAN_RE.finditer(text)]
-        ccs = [m.group(0) for m in _CC_RE.finditer(text)
-                if _digit_count(m.group(0)) >= 13]
+        user_hits = _gdpr_scan_region(user)
+        fetched_hits = _gdpr_scan_region(fetched)
+        fetched_len = len(fetched)
 
-        hits: list[tuple[str, list[str]]] = []
-        if emails:
-            hits.append(("email", emails))
-        if phones:
-            hits.append(("E.164 phone", phones))
-        if ssns:
-            hits.append(("US SSN", ssns))
-        if ibans:
-            hits.append(("IBAN", ibans))
-        if ccs:
-            hits.append(("payment-card-like", ccs))
-        if not hits:
+        # Build per-kind hit summaries with severity. Each entry is
+        # (label, severity, count, samples).
+        hit_lines: list[tuple[str, str, int, list[str]]] = []
+
+        # email + phone: density-scaled in fetched, always-warn in user
+        for kind in ("email", "phone"):
+            u = user_hits[kind]
+            f_ = fetched_hits[kind]
+            if u:
+                hit_lines.append((
+                    kind, "warn", len(u), u[:5],
+                ))
+            if f_:
+                if _is_dense(len(f_), fetched_len):
+                    hit_lines.append((
+                        f"{kind} (dense, in fetched content)",
+                        "warn", len(f_), f_[:5],
+                    ))
+                else:
+                    hit_lines.append((
+                        f"{kind} (sparse, in author/contact block)",
+                        "info", len(f_), f_[:5],
+                    ))
+
+        # SSN / IBAN / cc: always warn, anywhere.
+        for kind, label in (("ssn", "US SSN"), ("iban", "IBAN"),
+                             ("cc", "payment-card-like")):
+            combined = user_hits[kind] + fetched_hits[kind]
+            if combined:
+                hit_lines.append((
+                    label, "warn", len(combined), combined[:5],
+                ))
+
+        if not hit_lines:
             continue
 
-        # Summary uses counts only (manifest-safe).
-        summary = ", ".join(f"{len(lst)}×{kind}" for kind, lst in hits)
-        # Samples list is for local display only. The manifest-write path
-        # strips this key.
+        max_severity = "info"
+        for _, sev, _, _ in hit_lines:
+            if sev == "warn":
+                max_severity = "warn"
+                break
+
+        # Summary uses counts + per-kind context (no values).
+        summary = ", ".join(f"{c}×{label}" for label, _, c, _ in hit_lines)
+        # Samples are local-only; manifest_safe() strips them.
         samples_flat: list[str] = []
-        for kind, lst in hits:
-            for s in lst[:5]:
-                samples_flat.append(f"{kind}: {s}")
+        for label, _, _, samples in hit_lines:
+            for s in samples:
+                samples_flat.append(f"{label}: {s}")
 
         out.append({
             "kind": "gdpr_likely_pii",
-            "severity": "warn",
+            "severity": max_severity,
             "subject": str(p),
             "summary": f"possible personal data ({summary})",
             "rationale": (
                 "These patterns may be real people's personal data "
-                "(emails, phones, SSN, IBAN, payment numbers). "
-                "Publishing personal data without consent can trigger "
-                "GDPR (EU), CCPA (California), or equivalent regimes. "
-                "Reserved test domains (example.com/.org/.net, "
-                "localhost, .test) and academic identifiers (arXiv IDs, "
-                "DOIs, ISBNs) are excluded by construction. Review the "
-                "remaining matches: confirm they aren't real-person "
-                "data and override, or redact before publishing. "
-                "Examples are shown in the local terminal output; they "
-                "are NOT written to the export manifest."
+                "(emails, phones, SSN, IBAN, payment-card-shaped). "
+                "Severity model: matches outside FETCHED CONTENT "
+                "markers are always WARN (user-typed content). Inside "
+                "markers (publisher's text), SSN/IBAN/payment-card "
+                "stay WARN; email/phone scale by density — sparse "
+                "patterns (author/contact block in an academic paper) "
+                "are INFO, dense patterns (directory or DB dump) are "
+                "WARN. Density threshold is 0.5 matches per 1000 "
+                "chars. Reserved test domains and academic identifiers "
+                "(arXiv IDs, DOIs, ISBNs) are excluded by construction. "
+                "Examples appear in local terminal output only and are "
+                "NOT written to the export manifest."
             ),
             "samples": samples_flat,
         })
