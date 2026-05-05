@@ -8,6 +8,7 @@ codes, and import-time setup as well as logic.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from conftest import run_script
@@ -462,7 +463,9 @@ def test_export_no_preflight_skips_checks(env_with_ce, tmp_path: Path):
         env=env_with_ce,
     )
     manifest = json.loads((out / "_export-manifest.json").read_text())
-    assert manifest["preflight_findings"] == []
+    # v0.2.1: manifest defaults to summary-only. With --no-preflight no
+    # detectors ran, so the summary is empty.
+    assert manifest["preflight_summary"] == []
 
 
 def test_export_yes_in_noninteractive_proceeds_with_findings(
@@ -488,9 +491,12 @@ def test_export_yes_in_noninteractive_proceeds_with_findings(
         env=env_with_ce,
     )
     manifest = json.loads((out / "_export-manifest.json").read_text())
-    assert manifest["preflight_findings"]
-    assert any(f["kind"] == "quote_density"
-               for f in manifest["preflight_findings"])
+    # v0.2.1: default manifest is summary-only. Findings recorded as counts.
+    summary = manifest["preflight_summary"]
+    assert summary
+    assert any(s["kind"] == "quote_density" for s in summary)
+    # Default mode does NOT include per-finding records.
+    assert "preflight_findings" not in manifest
 
 
 def test_export_noninteractive_without_yes_refuses_on_findings(
@@ -515,6 +521,115 @@ def test_export_noninteractive_without_yes_refuses_on_findings(
         env=env_with_ce, check=False,
     )
     assert res.returncode != 0
+
+
+# --- manifest must never leak PII (v0.2.1 regression test) ---------------
+
+
+# Patterns that would prove a leak. We check the published manifest
+# *bytes* (json text) for any of these, not just structural fields,
+# because rationale strings or paths could embed them anywhere.
+_PII_FORBIDDEN_PATTERNS = [
+    # Real-shaped emails (after the reserved-test filter would have run).
+    re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
+    # SSN and IBAN shapes.
+    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    re.compile(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b"),
+]
+
+
+def _build_pii_fixture(ws: Path) -> None:
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\nhome\n"
+    )
+    # Page with real-shaped email + SSN + IBAN baked into its body.
+    # If the manifest emits these anywhere, the test fails.
+    (ws / "wiki" / "concepts" / "leaky.md").write_text(
+        "---\ntitle: Leaky\ntype: concept\nprojects: [p]\n---\n"
+        "Contact alice@somecompany.com or +1 555-0142. "
+        "SSN 987-65-4321. IBAN DE89370400440532013000.\n"
+    )
+
+
+def test_manifest_never_contains_pii_in_default_mode(
+        env_with_ce, tmp_path: Path):
+    """v0.2.0 leaked matched samples into manifest rationale; v0.2.1
+    defaults to summary-only output. This test would have caught the
+    v0.2.0 regression and locks the new behaviour in."""
+    ws = tmp_path / "ws-pii-default"
+    _build_pii_fixture(ws)
+    out = tmp_path / "exp-pii-default"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--yes",  # bypass the prompt; the test isn't about UX
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    text = (out / "_export-manifest.json").read_text()
+    for pat in _PII_FORBIDDEN_PATTERNS:
+        m = pat.search(text)
+        assert m is None, (
+            f"manifest leaked PII: pattern {pat.pattern!r} "
+            f"matched {m.group(0)!r}\n"
+            f"manifest content:\n{text}"
+        )
+
+
+def test_manifest_never_contains_pii_with_findings_included(
+        env_with_ce, tmp_path: Path):
+    """Even with --include-preflight-in-manifest, the per-finding records
+    are stripped of `samples` — they may include subjects (file paths)
+    and rationales but NOT raw matched values."""
+    ws = tmp_path / "ws-pii-included"
+    _build_pii_fixture(ws)
+    out = tmp_path / "exp-pii-included"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--yes",
+        "--include-preflight-in-manifest",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    # Per-finding records present — and PII-free.
+    assert manifest.get("preflight_findings"), \
+        "expected findings list when --include-preflight-in-manifest set"
+    for f in manifest["preflight_findings"]:
+        assert "samples" not in f, "samples must never reach the manifest"
+    text = (out / "_export-manifest.json").read_text()
+    for pat in _PII_FORBIDDEN_PATTERNS:
+        m = pat.search(text)
+        assert m is None, (
+            f"manifest leaked PII: pattern {pat.pattern!r} "
+            f"matched {m.group(0)!r}\n"
+            f"manifest content:\n{text}"
+        )
+
+
+def test_manifest_summary_records_pii_finding_count(
+        env_with_ce, tmp_path: Path):
+    """Even though raw values don't leak, the count is published — the
+    receiver sees `gdpr_likely_pii: 1` so they know to look locally."""
+    ws = tmp_path / "ws-pii-count"
+    _build_pii_fixture(ws)
+    out = tmp_path / "exp-pii-count"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--yes",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    summary = manifest["preflight_summary"]
+    pii_kinds = {s["kind"] for s in summary}
+    assert "gdpr_likely_pii" in pii_kinds
 
 
 # --- subgraph-export vault-sharing modes ----------------------------------
@@ -668,6 +783,131 @@ def test_hydrate_vault_no_missing_returns_clean(
         env=env_with_ce,
     )
     assert "no vault_missing stubs" in res.stdout
+
+
+# --- merge runs preflight on incoming content (v0.2.1) -------------------
+
+
+def test_merge_stage_runs_preflight_on_incoming(
+        wiki_a: Path, env_with_ce, tmp_path: Path):
+    """A merge source whose pages contain real-shaped emails should
+    surface a gdpr_likely_pii finding in the merge audit, with samples
+    stripped from manifest + audit."""
+    src = tmp_path / "leaky-src"
+    (src / "wiki" / "concepts").mkdir(parents=True)
+    (src / "wiki" / "projects").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / "wiki" / "projects" / "leaky-proj.md").write_text(
+        "---\ntitle: Leaky\ntype: project\n---\nhome\n"
+    )
+    (src / "wiki" / "concepts" / "leaky-page.md").write_text(
+        "---\ntitle: Leak\ntype: concept\nprojects: [leaky-proj]\n---\n"
+        "Author email: alice@somecompany.com. SSN 987-65-4321.\n"
+    )
+    run_script(
+        "merge.py", str(src), "--as-origin", "ext",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    staging = wiki_a / ".curator" / ".merge-staging" / "ext"
+    manifest = json.loads((staging / "apply.json").read_text())
+    # Findings recorded; samples stripped.
+    summary = manifest["preflight_summary"]
+    assert any(s["kind"] == "gdpr_likely_pii" for s in summary)
+    for f in manifest.get("preflight_findings", []):
+        assert "samples" not in f
+    # Audit report must not leak the email or SSN.
+    audit = (staging / "audit-report.md").read_text()
+    assert "alice@somecompany.com" not in audit
+    assert "987-65-4321" not in audit
+    # But audit explicitly mentions the kind.
+    assert "gdpr_likely_pii" in audit
+
+
+def test_merge_stage_preflight_does_not_block_apply(
+        wiki_a: Path, env_with_ce, tmp_path: Path):
+    """Pre-flight at merge stage is informational, not gating."""
+    src = tmp_path / "src-info"
+    (src / "wiki" / "concepts").mkdir(parents=True)
+    (src / "wiki" / "projects").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / "wiki" / "projects" / "info-proj.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (src / "wiki" / "concepts" / "p.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [info-proj]\n---\n"
+        "Contact +1 555-0142.\n"
+    )
+    run_script("merge.py", str(src), "--as-origin", "info",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    # Apply should succeed despite the finding.
+    run_script("merge.py", "--apply", "info",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    assert (wiki_a / ".curator" / "merges" / "info.json").is_file()
+
+
+# --- license allowlist (v0.2.1 tightening) --------------------------------
+
+
+def test_export_owned_excludes_cc_by_nc_by_default(
+        env_with_ce, tmp_path: Path):
+    """v0.2.1: CC-BY-NC removed from default --include-vault=owned set."""
+    ws = tmp_path / "ws-nc"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n(vault:nc.md)\n"
+    )
+    (ws / "vault" / "nc.md").write_text(
+        "---\ntitle: NC\nlicense: CC-BY-NC-4.0\n"
+        "source_url: https://example.org/p\n---\nbody\n"
+    )
+    out = tmp_path / "exp-nc-default"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--include-vault", "owned",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert not (out / "vault").exists() or not list((out / "vault").iterdir())
+
+
+def test_export_owned_with_allow_nc_includes_cc_by_nc(
+        env_with_ce, tmp_path: Path):
+    """The opt-in flag re-includes CC-BY-NC for users whose use case
+    is genuinely non-commercial."""
+    ws = tmp_path / "ws-allow-nc"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n(vault:nc.md)\n"
+    )
+    (ws / "vault" / "nc.md").write_text(
+        "---\ntitle: NC\nlicense: CC-BY-NC-4.0\n"
+        "source_url: https://example.org/p\n---\nbody\n"
+    )
+    out = tmp_path / "exp-allow-nc"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--include-vault", "owned",
+        "--allow-license-class", "nc",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    bundled = sorted(p.name for p in (out / "vault").iterdir())
+    assert bundled == ["nc.md"]
 
 
 # --- merge --rerun-gates --------------------------------------------------

@@ -1,5 +1,84 @@
 # Changelog
 
+## v0.2.1 — 2026-05-05
+
+Tighten the v0.2.0 pre-flight detectors after a critical review surfaced
+two privacy regressions, two false-positive disasters, and one design
+oversight. Manifest schema bumped to `2`.
+
+### Privacy regressions (fixed)
+
+- **PII no longer leaks into the published manifest.** v0.2.0 embedded
+  `Sample: alice@x.com, ...` directly inside `rationale` strings, which
+  flowed into `_export-manifest.json` and got published. v0.2.1
+  introduces a hard contract: every finding has a manifest-safe section
+  (`kind`, `severity`, `subject`, `summary`, `rationale`) and a local-
+  only `samples` list that is **always stripped** before any manifest
+  write. Enforced by `preflight.manifest_safe()` and tested by
+  regression tests that assert no `@`/SSN/IBAN patterns appear in
+  published manifest bytes.
+- **Manifest defaults to summary-only**: `preflight_summary: [{kind,
+  severity, count}]`. No subjects, no rationales. Receivers see *what
+  categories fired*, not *which files*. Prevents a `topic:curiosity-
+  wiki` GitHub query from becoming a harvesting oracle. Per-finding
+  records still available via `--include-preflight-in-manifest` (still
+  no samples).
+
+### False-positive fixes
+
+- **Phone detector rebuilt as E.164-only**. v0.2.0's generic phone regex
+  matched arXiv IDs (`2401.12345`), DOIs (`10.1038/s41586-021-03819-2`),
+  ISBNs (`978-3-16-148410-0`), citation stems (`vaswani-2017-1706.03762`),
+  year ranges (`(1942-2018)`) — useless on academic content. v0.2.1
+  matches only `+`-prefix E.164 (8–15 digits). Documented limitation:
+  real-people phones without `+` pass through.
+- **Payment-card detector requires real issuer prefix**. Visa `4`,
+  Mastercard `51-55`, Amex `34/37`, Discover `6011/65`. ISBN-13 numbers
+  (`978`/`979`) no longer false-positive. Comment clarified: the regex
+  is for *flagging* PII, not processing payments.
+- **GPL detector tightened**. Now matches only: (a) frontmatter
+  `license: GPL-*`, (b) SPDX identifier anywhere, (c) GPL keyword inside
+  a triple-backtick fenced code block. Bare prose mentions of GPL or
+  copyleft (e.g. a Stallman bio, license-comparison page) no longer
+  fire.
+- **Email regex broadened for RFC 6531 i18n**. `José@example.org`,
+  `用户@邮件.中国` now match. Reserved-domain filter rebuilt: RFC 6761
+  domains (`example.com/.org/.net`, `localhost`, `*.test`, `*.example`,
+  `*.invalid`, `*.local`) filter as test data. The bogus v0.2.0 noise
+  filter (`__init__`, `test_`) is gone.
+
+### License allowlist tightened
+
+- **`CC-BY-NC` and `CC-BY-ND` removed from default allowlist** for
+  `--include-vault=owned`. NC forbids commercial use; ND forbids
+  derivatives. The wiki's normal operation (extraction, classification,
+  summarization, redistribution) may exceed both clauses. Users with a
+  compliant use case can re-include via `--allow-license-class nc,nd`.
+
+### Coverage extended
+
+- **Pre-flight runs on merge stage**. Receivers now get the same
+  detector pass on incoming staged content. Findings appear in the merge
+  audit report; samples remain local-only there too. Informational —
+  does not block apply.
+
+### Documentation
+
+- `docs/licensing.md` rewritten: manifest-safety contract, detector
+  scopes, license allowlist policy, philosophy.
+- `docs/trust-model.md` cross-references the manifest-safety contract.
+- Manifest schema version bumped to `2`.
+
+### Tests
+
+- 60 tests passing (was 47). New: regression test asserting published
+  manifests contain zero `@`/SSN/IBAN regex matches anywhere; per-
+  detector tests for E.164-only phone, i18n email, reserved-domain
+  filter, GPL prose non-match, GPL frontmatter/SPDX/fence match,
+  manifest_safe/summary projection, NC/ND allowlist removal +
+  `--allow-license-class` opt-in, merge-stage preflight integration
+  + audit redaction.
+
 ## v0.2.0 — 2026-05-04
 
 Sharing-safe defaults and licensing-aware merge.

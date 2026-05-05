@@ -106,11 +106,14 @@ def test_redact_url_handles_empty():
 # --- gpl_contagion --------------------------------------------------------
 
 
-def test_gpl_contagion_detects_full_name(tmp_path: Path):
+def test_gpl_contagion_detects_frontmatter_license(tmp_path: Path):
+    """v0.2.1: frontmatter `license: GPL-*` is the cleanest signal of
+    actual GPL-licensed content."""
     f = _w(tmp_path / "p.md",
-           "---\nt: x\n---\nLicensed under the GNU General Public License.\n")
+           "---\ntitle: P\nlicense: GPL-3.0\n---\ncontent\n")
     findings = preflight.find_gpl_contagion([f])
     assert findings and findings[0]["subject"] == str(f)
+    assert "frontmatter" in findings[0]["summary"]
 
 
 def test_gpl_contagion_detects_spdx(tmp_path: Path):
@@ -118,13 +121,28 @@ def test_gpl_contagion_detects_spdx(tmp_path: Path):
            "---\nt: x\n---\nSPDX-License-Identifier: AGPL-3.0-or-later\n")
     findings = preflight.find_gpl_contagion([f])
     assert findings
+    assert "SPDX" in findings[0]["summary"]
 
 
-def test_gpl_contagion_detects_short_form(tmp_path: Path):
-    f = _w(tmp_path / "p.md",
-           "---\nt: x\n---\nThis library is GPLv3 only.\n")
+def test_gpl_contagion_detects_in_fenced_code_block(tmp_path: Path):
+    """GPL keyword inside a triple-backtick fence — likely a pasted
+    license header from upstream code."""
+    f = _w(tmp_path / "p.md", "---\nt: x\n---\n"
+           "```c\n/* This file is licensed under GPLv3 only */\n"
+           "int main(){}\n```\n")
     findings = preflight.find_gpl_contagion([f])
     assert findings
+    assert "fenced code" in findings[0]["summary"]
+
+
+def test_gpl_contagion_skips_prose_mentions(tmp_path: Path):
+    """v0.2.1 explicitly does NOT match prose discussions of the GPL —
+    that was the false-positive bug in v0.2.0."""
+    prose = _w(tmp_path / "history.md", "---\ntitle: Free Software\n---\n"
+               "Stallman's vision of copyleft, codified in the GNU General "
+               "Public License, became the philosophical foundation. "
+               "This wiki page is itself MIT-licensed.\n")
+    assert preflight.find_gpl_contagion([prose]) == []
 
 
 def test_gpl_contagion_skips_clean_content(tmp_path: Path):
@@ -160,11 +178,81 @@ def test_gdpr_pii_finds_ssn_and_iban(tmp_path: Path):
     assert "IBAN" in summary
 
 
-def test_gdpr_pii_phone_digit_floor(tmp_path: Path):
-    """Short numeric strings shouldn't match (e.g. years, page numbers)."""
-    f = _w(tmp_path / "p.md",
-           "---\nt: x\n---\nSee 2024 and table 3.14 for details.\n")
+def test_gdpr_pii_phone_e164_only(tmp_path: Path):
+    """v0.2.1: phone detection requires E.164 (`+` prefix). Local-format
+    numbers, arXiv IDs, DOIs, ISBNs, citation stems all pass clean."""
+    academic = _w(tmp_path / "academic.md", "---\nt: x\n---\n"
+                   "See arxiv:2401.12345 and DOI: 10.1038/s41586-021-03819-2. "
+                   "ISBN 978-3-16-148410-0. Stem vaswani-2017-1706.03762. "
+                   "Range (1942-2018), and pages 100-1023.\n")
+    assert preflight.find_gdpr_likely_pii([academic]) == []
+    real_phone = _w(tmp_path / "phone.md", "---\nt: x\n---\n"
+                     "Contact +1 555-0142 between 9-5.\n")
+    findings = preflight.find_gdpr_likely_pii([real_phone])
+    assert findings
+    assert "phone" in findings[0]["summary"].lower()
+
+
+def test_gdpr_pii_email_i18n_caught(tmp_path: Path):
+    """RFC 6531 internationalised addresses match the v0.2.1 regex."""
+    f = _w(tmp_path / "p.md", "---\nt: x\n---\n"
+           "Contact 用户@邮件.中国 directly.\n")
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+
+
+def test_gdpr_pii_reserved_test_domains_filtered(tmp_path: Path):
+    """RFC 6761 reserved test domains and TLDs filter out as noise."""
+    f = _w(tmp_path / "p.md", "---\nt: x\n---\n"
+           "Send to alice@example.org or bob@example.net or carol@test.local "
+           "or dave@something.test. None are real.\n")
     assert preflight.find_gdpr_likely_pii([f]) == []
+
+
+# --- manifest-safety projection ------------------------------------------
+
+
+def test_manifest_safe_strips_samples(tmp_path: Path):
+    f = _w(tmp_path / "p.md",
+           "---\nt: x\n---\nContact alice@somecompany.com.\n")
+    findings = preflight.find_gdpr_likely_pii([f])
+    assert findings
+    assert findings[0]["samples"]  # local-display samples populated
+    safe = preflight.manifest_safe(findings[0])
+    assert "samples" not in safe
+    # Rationale must NOT contain the matched email.
+    assert "alice@somecompany.com" not in safe["rationale"]
+    assert "alice@somecompany.com" not in safe["summary"]
+
+
+def test_manifest_summary_aggregates_counts(tmp_path: Path):
+    findings = [
+        {"kind": "gdpr_likely_pii", "severity": "warn",
+         "subject": "a.md", "summary": "...", "rationale": "..."},
+        {"kind": "gdpr_likely_pii", "severity": "warn",
+         "subject": "b.md", "summary": "...", "rationale": "..."},
+        {"kind": "quote_density", "severity": "warn",
+         "subject": "c.md", "summary": "...", "rationale": "..."},
+    ]
+    s = preflight.manifest_summary(findings)
+    by_kind = {e["kind"]: e["count"] for e in s}
+    assert by_kind["gdpr_likely_pii"] == 2
+    assert by_kind["quote_density"] == 1
+    # Summary must NOT include subjects or any per-record data beyond counts.
+    for entry in s:
+        assert set(entry.keys()) == {"kind", "severity", "count"}
+
+
+# --- license allowlist (v0.2.1 tightening) -------------------------------
+
+
+def test_open_license_tokens_excludes_nc_nd():
+    assert "cc-by-nc" not in preflight._OPEN_LICENSE_TOKENS
+    assert "cc-by-nd" not in preflight._OPEN_LICENSE_TOKENS
+    assert "cc-by-nc-sa" not in preflight._OPEN_LICENSE_TOKENS
+    # But the unrestricted CC family stays.
+    assert "cc-by" in preflight._OPEN_LICENSE_TOKENS
+    assert "cc-by-sa" in preflight._OPEN_LICENSE_TOKENS
 
 
 # --- run_all + format_findings -------------------------------------------

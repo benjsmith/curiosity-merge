@@ -57,7 +57,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import preflight  # type: ignore  # noqa: E402
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 # --- path-traversal guards --------------------------------------------------
@@ -176,13 +176,42 @@ def _one_hop_neighbors(page: Path, all_pages: list[Path], wiki_dir: Path) -> lis
 # Licenses + flags we treat as "owner has indicated this content is
 # redistributable". Conservative: defaults that aren't redistributable
 # (Elsevier, paywalled blogs, "all rights reserved") fail closed.
+#
+# v0.2.1: CC-BY-NC and CC-BY-ND removed from the default. NC forbids
+# commercial use; ND forbids derivatives. The wiki's normal operation
+# (extraction, classification, summarization, redistribution inside
+# curiosity-engine workflows) may exceed both. Users with a specific
+# use case that complies can opt in via --allow-license-class.
 _REDISTRIBUTABLE_LICENSES = {
     "cc0", "public-domain", "publicdomain",
-    "cc-by", "cc-by-sa", "cc-by-nc", "cc-by-nd",
+    "cc-by", "cc-by-sa",
     "cc-by-3.0", "cc-by-4.0", "cc-by-sa-3.0", "cc-by-sa-4.0",
     "mit", "apache-2.0", "apache2", "bsd", "bsd-3-clause", "bsd-2-clause",
-    "arxiv-non-exclusive",  # arXiv's default license permits redistribution
+    "mpl-2.0",
+    "arxiv-non-exclusive",  # arXiv's default license permits redistribution;
+                            # see docs/licensing.md for the third-party caveat
 }
+# Tokens added on demand via --allow-license-class.
+_NC_LICENSE_TOKENS = {
+    "cc-by-nc", "cc-by-nc-sa",
+    "cc-by-nc-3.0", "cc-by-nc-4.0", "cc-by-nc-sa-3.0", "cc-by-nc-sa-4.0",
+}
+_ND_LICENSE_TOKENS = {
+    "cc-by-nd", "cc-by-nc-nd",
+    "cc-by-nd-3.0", "cc-by-nd-4.0", "cc-by-nc-nd-3.0", "cc-by-nc-nd-4.0",
+}
+
+
+def _effective_license_allowlist(allow_class_csv: str) -> set[str]:
+    """Build the runtime allowlist by adding opt-in classes to the default."""
+    out = set(_REDISTRIBUTABLE_LICENSES)
+    classes = {c.strip().lower() for c in (allow_class_csv or "").split(",")
+               if c.strip()}
+    if "nc" in classes:
+        out |= _NC_LICENSE_TOKENS
+    if "nd" in classes:
+        out |= _ND_LICENSE_TOKENS
+    return out
 
 
 _FM_KEY_RE = re.compile(r"^([a-z_][a-z0-9_]*):\s*(.+?)\s*$", re.IGNORECASE)
@@ -214,7 +243,14 @@ def _raw_frontmatter(text: str) -> dict[str, str]:
     return out
 
 
-def _vault_redistributable(text: str) -> bool:
+def _vault_redistributable(text: str,
+                           allowlist: set[str] | None = None) -> bool:
+    """Decide whether a vault file's frontmatter declares redistributable
+    content. `allowlist` defaults to the conservative `_REDISTRIBUTABLE_LICENSES`
+    set; callers can broaden via --allow-license-class.
+    """
+    if allowlist is None:
+        allowlist = _REDISTRIBUTABLE_LICENSES
     fm = _raw_frontmatter(text)
     redistrib = fm.get("redistributable", "").lower()
     if redistrib in ("true", "yes", "1"):
@@ -222,11 +258,13 @@ def _vault_redistributable(text: str) -> bool:
     if redistrib in ("false", "no", "0"):
         return False
     license_str = fm.get("license", "").lower().strip()
-    if license_str in _REDISTRIBUTABLE_LICENSES:
+    if license_str in allowlist:
         return True
     # arXiv URLs imply arXiv's non-exclusive license unless the author
     # explicitly relicensed; we treat them as redistributable for
-    # subgraph-export purposes (the receiver still re-fetches by default).
+    # subgraph-export purposes. Caveat: arXiv's license is granted to
+    # *arXiv*, not third parties — third-party redistribution is common
+    # practice but not a strict legal entitlement. See docs/licensing.md.
     src_url = fm.get("source_url", "").lower()
     if "arxiv.org" in src_url or "biorxiv.org" in src_url or "chemrxiv.org" in src_url:
         return True
@@ -293,20 +331,23 @@ def _collect_cited_vault(scope_pages: list[Path], vault_dir: Path) -> list[Path]
     return out
 
 
-def _filter_vault_for_mode(vault_files: list[Path], mode: str) -> list[Path]:
+def _filter_vault_for_mode(vault_files: list[Path], mode: str,
+                            allowlist: set[str] | None = None) -> list[Path]:
     """Apply --include-vault mode. Default `none` is sharing-safe."""
     if mode == "none":
         return []
     if mode == "all":
         return list(vault_files)
     if mode == "owned":
+        if allowlist is None:
+            allowlist = _REDISTRIBUTABLE_LICENSES
         out = []
         for p in vault_files:
             try:
                 text = p.read_text(errors="replace")
             except OSError:
                 continue
-            if _vault_redistributable(text):
+            if _vault_redistributable(text, allowlist=allowlist):
                 out.append(p)
         return out
     raise SystemExit(f"unknown --include-vault mode: {mode!r}")
@@ -370,14 +411,31 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
                     scope_pages_rel: list[str], scope_vault_rel: list[str],
                     vault_metadata: list[dict],
                     include_vault_mode: str,
-                    preflight_findings: list[dict] | None = None) -> None:
+                    preflight_findings: list[dict] | None = None,
+                    include_preflight_in_manifest: bool = False) -> None:
     """Write `_export-manifest.json`.
 
     `vault_metadata` records every cited vault file regardless of whether
     its content was included — sha256, source_url, source_type, license.
     Receivers use this to hydrate missing sources after merge. Excluding
     bytes but recording metadata is the licensing-safe default.
+
+    Pre-flight findings split (v0.2.1):
+      - `preflight_summary` (always) — `[{kind, severity, count}]`. No
+        subjects, no samples. Tells receivers what categories fired
+        without revealing where or what.
+      - `preflight_findings` (only when caller passes
+        `include_preflight_in_manifest=True`) — manifest-safe finding
+        records (kind/severity/subject/summary/rationale). Samples
+        (`samples` field) are stripped at this boundary regardless,
+        enforced by `preflight.manifest_safe(...)`.
+
+    The default summary-only mode prevents two leaks:
+      1. Sample data (emails, SSNs) embedded in rationale strings.
+      2. Subject lists that act as a "where to harvest" map for scrapers
+         of published wikis.
     """
+    findings = preflight_findings or []
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "exported_at": _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -392,8 +450,12 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
         "scope_pages": scope_pages_rel,
         "scope_vault": scope_vault_rel,
         "vault_metadata": vault_metadata,
-        "preflight_findings": preflight_findings or [],
+        "preflight_summary": preflight.manifest_summary(findings),
     }
+    if include_preflight_in_manifest:
+        manifest["preflight_findings"] = [
+            preflight.manifest_safe(f) for f in findings
+        ]
     (dest / "_export-manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
@@ -454,6 +516,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="refuse to proceed if any preflight detector fires")
     ap.add_argument("--no-preflight", action="store_true",
                     help="skip all preflight checks (not recommended)")
+    ap.add_argument("--include-preflight-in-manifest", action="store_true",
+                    help="write full per-finding records to the manifest "
+                         "(default: counts only — published manifests should "
+                         "not name files that tripped GDPR/PII detection or "
+                         "they become a harvesting oracle)")
+    ap.add_argument("--allow-license-class", default="",
+                    help="comma-separated license-class tokens to re-include "
+                         "in --include-vault=owned (default: empty). Use "
+                         "`nc` to allow CC-BY-NC, `nd` for CC-BY-ND. The "
+                         "wiki's normal operation may exceed both clauses; "
+                         "opt in only when you've confirmed your use case "
+                         "complies.")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing files at destination")
     args = ap.parse_args(argv)
@@ -532,7 +606,10 @@ def main(argv: list[str] | None = None) -> int:
             **meta,
         })
 
-    vault_files = _filter_vault_for_mode(cited_vault_files, args.include_vault)
+    license_allowlist = _effective_license_allowlist(args.allow_license_class)
+    vault_files = _filter_vault_for_mode(
+        cited_vault_files, args.include_vault, allowlist=license_allowlist
+    )
 
     # Pre-flight: run detectors on what we're about to ship. Surface any
     # findings, prompt for confirmation. Strict mode refuses on any hit.
@@ -596,6 +673,7 @@ def main(argv: list[str] | None = None) -> int:
         vault_metadata=vault_metadata,
         include_vault_mode=args.include_vault,
         preflight_findings=findings,
+        include_preflight_in_manifest=args.include_preflight_in_manifest,
     )
 
     omitted = len(vault_metadata) - len(vault_rel)

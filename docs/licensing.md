@@ -82,20 +82,59 @@ After successful hydration, the source stub's `vault_missing: true` flag is clea
 
 ## Pre-flight checks
 
-`subgraph-export` runs a battery of detectors before write and surfaces findings with rationale. The user accepts (`--yes` or interactive `y`), refuses (`--strict` or interactive `N`), or skips (`--no-preflight`). Each finding lands in the export manifest under `preflight_findings` so receivers can see what was flagged.
+`subgraph-export` runs detectors before write and surfaces findings with plain-language rationale. The user accepts (`--yes` or interactive `y`), refuses (`--strict` or interactive `N`), or skips (`--no-preflight`). `merge` runs the same detectors over staged incoming content and reports findings in the audit (informational only — does not block apply, since the receiver is the one deciding whether to apply).
+
+### Manifest-safety contract (v0.2.1)
+
+Every finding has two parts:
+
+- **Manifest-safe**: `kind`, `severity`, `subject` (path), `summary` (counts only), `rationale` (explains the category, never contains samples).
+- **Local-only**: `samples` (the actual matched values — emails, SSNs, GPL context snippets). **Never written to a manifest or audit report under any flag.** Shown only in the local terminal during interactive review and stripped at the manifest-write boundary by `preflight.manifest_safe(...)`.
+
+The default published manifest uses the most conservative projection: `preflight_summary: [{kind, severity, count}]`. No subjects, no rationales, no samples. Counts only. A published wiki tells receivers *what categories fired* without revealing *which files contained what* — important because a `topic:curiosity-wiki` GitHub query would otherwise become a harvesting oracle for any kind that fired.
+
+`--include-preflight-in-manifest` opts in to per-finding records (still without samples). Useful for fully-private workflows where the publisher and receiver are the same person and full context should travel with the export.
+
+### Detector table
 
 | Detector | What it catches | Default | Override |
 |---|---|---|---|
-| `non_native_page` | wiki pages whose `origin:` tag indicates they came from a previous merge — re-publishing them propagates someone else's content through your own export | excluded from scope | `--include-non-native` |
-| `quote_density` | wiki pages where ≥25% of body is inside `>` block quotes — likely reproducing publisher prose under thin transformative coverage | warn | `--quote-density-threshold 0.5` (or higher) |
-| `license_inconsistent` | vault files declaring an open license but with `source_url` on a paywalled-publisher domain — either the URL is mislabeled or the license tag is wrong | warn | review and fix the frontmatter |
-| `gpl_contagion` | vault or wiki pages containing GPL/AGPL/LGPL license markers — copyleft / share-alike requirements may oblige your published wiki to inherit GPL too | warn | re-license the published wiki, remove the content, or confirm fair-use exception |
-| `gdpr_likely_pii` | likely personal data (emails, phones, SSN, IBAN, credit-card-like numbers) in vault or wiki body | warn | redact, drop the source, or confirm the matches aren't real-person data |
-| `redact_url` | source URL query strings (signed S3, session tokens, `utm_*`) | redacted in manifest | `--keep-url-params` |
+| `non_native_page` | wiki pages with `origin:` tag from a previous merge | **excluded from scope** | `--include-non-native` |
+| `quote_density` | pages where ≥25% of body is inside `>` block quotes | warn | `--quote-density-threshold` |
+| `license_inconsistent` | vault file with declared open license but URL on a paywalled-publisher domain | warn | fix the frontmatter |
+| `gpl_contagion` | **frontmatter `license: GPL-*`**, **SPDX identifier**, or **GPL keyword inside a fenced code block**. Bare prose mentions of GPL/copyleft are NOT flagged (v0.2.0 over-warned on free-software history pages) | warn | re-license, remove, or fair-use defense |
+| `gdpr_likely_pii` | `email` (RFC 6531 i18n; reserved test domains filtered), `phone` (E.164 only — `+` prefix, 8–15 digits), `SSN`, `IBAN`, `payment-card-like` (Visa/MC/Amex/Discover prefixes, not ISBN) | warn | redact, drop, or confirm matches are non-PII |
+| `redact_url` | source URL query strings | redacted in manifest | `--keep-url-params` |
 
-The detectors are deliberately conservative — false positives are recoverable (user overrides), false negatives are not (a missed GDPR issue ships to the public). Expect the GDPR detector in particular to fire on technical content that contains `@example.com` (filtered) or quoted phone numbers (not filtered) — review and override when appropriate.
+### Phone detection scope
 
-The detectors do **not** replace legal review for high-stakes publishing. A wiki tightly built on commercial content benefits from a human read of the `preflight_findings` block before push.
+Only **E.164 international format** (`+` prefix, 8–15 digits, optional spaces/dashes between groups) is detected. Local-format numbers (`555-0142`, `(020) 7946 0958`) are not flagged. Reason: local formats are inherently confusable with academic identifiers (arXiv IDs, DOIs, ISBNs, citation stems, year ranges) which appear in nearly every science wiki — flagging them produced a near-100% false-positive rate in v0.2.0. E.164 is the only globally unambiguous phone signal. **Documented limitation**: real-people phone numbers without `+` prefix pass through.
+
+### Email detection scope
+
+Broad enough for RFC 6531 internationalised addresses (`José@example.org`, `用户@邮件.中国`). RFC 6761 reserved test domains and TLDs (`example.com`, `example.org`, `example.net`, `localhost`, `*.test`, `*.example`, `*.invalid`, `*.localhost`, `*.local`) are filtered out automatically.
+
+### Payment-card detection scope
+
+The detector fires only on digit strings *shaped like* a card number — used to **flag possible-PII**, not to process payments. This skill never accepts, transmits, or stores payment data. The regex requires a real issuer prefix (Visa `4`, Mastercard `51-55`, Amex `34`/`37`, Discover `6011`/`65xx`); ISBN-13 numbers (which start with `978`/`979`) and other long numeric identifiers don't match.
+
+### GPL detection scope
+
+Three paths to a hit, all conservative:
+
+1. Frontmatter `license:` value starts with `gpl`/`agpl`/`lgpl`.
+2. SPDX-License-Identifier line anywhere in the file.
+3. GPL keyword (`GPLv3`, `AGPL-3.0`, etc.) inside a triple-backtick fenced code block.
+
+Bare prose mentions ("the GPL", "copyleft as a concept", "Stallman wrote the GNU General Public License") are explicitly **not flagged**. v0.2.0 fired on every wiki page that *discussed* free-software licensing as a topic; v0.2.1 narrowed to applied-license signals only.
+
+### License allowlist for `--include-vault=owned` (tightened in v0.2.1)
+
+Default allowlist: `CC0`, `public-domain`, `CC-BY`, `CC-BY-SA` (+ versions), `MIT`, `Apache-2.0`, `BSD-*`, `MPL-2.0`, `arxiv-non-exclusive`. **Removed from default**: `CC-BY-NC`, `CC-BY-ND`, `CC-BY-NC-SA`, `CC-BY-NC-ND`. NC forbids commercial use; ND forbids derivatives. The wiki's normal operation (extraction, classification, summarization, redistribution inside curiosity-engine workflows) may exceed both. Users with a use case that complies can opt in with `--allow-license-class nc,nd`.
+
+### Detector philosophy
+
+False positives are recoverable (user overrides). False negatives are not (a missed GDPR issue ships to the public). The detectors don't replace legal review — they catch the easy mistakes that make obvious headlines.
 
 ## Recommendations for publishing wikis
 

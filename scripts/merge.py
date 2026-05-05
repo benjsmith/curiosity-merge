@@ -61,6 +61,7 @@ except ImportError as e:
 # uv run or as a module.
 sys.path.insert(0, str(Path(__file__).parent))
 import reconcile  # type: ignore
+import preflight  # type: ignore
 
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -516,6 +517,41 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
             L.append(f"- ... and {len(missing) - 20} more")
         L.append("")
 
+    pf = manifest.get("preflight_findings", [])
+    pf_summary = manifest.get("preflight_summary", [])
+    if pf or pf_summary:
+        L.append("## Pre-flight findings on incoming content")
+        L.append("")
+        L.append(
+            "Detectors run on staged content. These are *informational*: "
+            "they don't block apply. Review and decide whether incoming "
+            "material is appropriate for your wiki. Samples (matched "
+            "values) are stripped from the audit and manifest by design — "
+            "scan the staged files locally if you need to see specifics."
+        )
+        L.append("")
+        if pf_summary:
+            for entry in pf_summary:
+                L.append(f"- **{entry['kind']}** ({entry['severity']}): "
+                         f"{entry['count']} hit(s)")
+            L.append("")
+        if pf:
+            for f in pf[:30]:
+                L.append(f"  - `{f.get('subject','?')}` — "
+                         f"{f.get('kind','?')}: {f.get('summary','')}")
+            if len(pf) > 30:
+                L.append(f"  - ... and {len(pf) - 30} more")
+            # Surface one rationale per kind for context.
+            seen_kinds: set[str] = set()
+            for f in pf:
+                k = f.get("kind", "")
+                if k in seen_kinds:
+                    continue
+                seen_kinds.add(k)
+                L.append("")
+                L.append(f"  why ({k}): {f.get('rationale','')}")
+            L.append("")
+
     L.append("## Manifest counts")
     L.append("")
     L.append(f"- wiki pages imported: {len(manifest['wiki_pages'])}")
@@ -721,6 +757,27 @@ def cmd_stage(args) -> int:
     gate_skips = [q for q in optional if not q.get("path") and (q.get("skipped") or q.get("reason"))]
     _quarantine_files(staging, quarantines)
 
+    # 6b. Pre-flight detectors on incoming content. Receivers deserve the
+    # same licensing/PII review the publisher should have done. We always
+    # set include_non_native=True because everything from a merge is
+    # foreign by definition — that detector would be 100% noise here.
+    # Findings are *informational* (not gating); the receiver reviews and
+    # decides what to do with each. Samples are stripped via
+    # `manifest_safe` before they land in apply.json or the audit report.
+    staged_pages = [p for d in (staging["wiki_in"], staging["collisions"])
+                    for p in d.rglob("*.md")] if (
+        staging["wiki_in"].is_dir() or staging["collisions"].is_dir()
+    ) else []
+    staged_vault = [p for p in staging["vault_in"].rglob("*")
+                     if p.is_file()] if staging["vault_in"].is_dir() else []
+    preflight_findings = preflight.run_all(
+        scope_pages=staged_pages,
+        vault_files=staged_vault,
+        include_non_native=True,
+    )
+    preflight_findings_safe = [preflight.manifest_safe(f)
+                                for f in preflight_findings]
+
     # 7. Manifest + audit.
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -740,6 +797,8 @@ def cmd_stage(args) -> int:
         "accepted_bridges": [],  # populated post-discover-bridges review
         "quarantines": quarantines,
         "missing_vault": missing_vault_marks,
+        "preflight_summary": preflight.manifest_summary(preflight_findings),
+        "preflight_findings": preflight_findings_safe,
     }
     staging["apply_json"].write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
