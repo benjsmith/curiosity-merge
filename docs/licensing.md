@@ -131,7 +131,44 @@ Why density: an arXiv paper's corresponding-author block (~5–20 emails per 50K
 
 **File-level severity = max across kinds.** A paper with sparse author emails (info) plus one IBAN (warn) lands as warn — the IBAN dominates.
 
-**Info-only findings don't gate.** Severity-aware UX: info-only findings produce a one-line stderr acknowledgement and proceed. Warn/block findings prompt for confirmation interactively, refuse in non-interactive mode without `--yes`, refuse always under `--strict`. This means the typical academic export flows through without interruption while real concerns still require deliberate confirmation.
+**Info-only findings don't gate.** Severity-aware UX: info-only findings produce a one-line stderr acknowledgement and proceed. Warn/block findings are routed through the gating policy (see below).
+
+### Gating policy: `--refuse-on` and `--accept-on` (v0.4.0)
+
+Two flags control what happens when a warn/block finding is produced. Each takes a single value:
+
+- `all` — every kind
+- `none` (default) — no kind; fall through to interactive prompt
+- comma-separated kind list (e.g. `quote_density,gpl_contagion`)
+
+`--refuse-on=VALUE` — kinds that should *cause the export to fail*. `--accept-on=VALUE` — kinds that should *auto-accept without prompt*. Per-finding resolution: if the kind is in `accept_on`, accept; else if in `refuse_on`, refuse; else prompt (or refuse if non-interactive).
+
+Specific-kind decisions take precedence over `all`, so `--refuse-on=all --accept-on=quote_density` is "refuse everything except quote_density" (carve-out), and `--refuse-on=gpl_contagion --accept-on=all` is "accept everything except GPL" (carve-in). Contradictions error at parse time:
+
+- Same kind in both CSVs → error
+- `--refuse-on=all --accept-on=all` → error
+- Unknown kind name → error
+- Empty value (`--refuse-on=""`) → error
+
+Deprecated aliases: `--strict` → `--refuse-on=all`, `--yes` → `--accept-on=all`. Both still work and emit a one-line stderr deprecation note.
+
+### Persistent acks (v0.4.0)
+
+Reviewed a finding once and want it suppressed on future runs? `--remember-acks` persists every accepted finding to `.curator/preflight-acks.json`. The interactive prompt becomes `[y/N/a]` where `a` = "yes for this run AND remember as ack."
+
+**Ack key**: `sha256(file_sha256 + kind + summary)`. Any change to the file content or the detector's reading invalidates the ack and re-presents the finding. Acks are manifest-safe: samples are never persisted (the ack file is regular JSON in your repo and must not become a side-channel).
+
+Management:
+- `subgraph_export.py --list-acks` — print the table.
+- `subgraph_export.py --clear-acks` — wipe the ack file (interactive confirm; auto-confirm via `--accept-on=all`).
+
+### Standalone audit command
+
+```
+uv run python3 <skill_path>/scripts/preflight.py --workspace .
+```
+
+Read-only: scans the workspace, prints findings, never writes to caches or ack files. Exit codes are CI-friendly: `0` clean or info-only, `1` any warn/block, `2` operational error. `--json` for machine-readable output (always manifest-safe). `--scope` restricts to specific files. `--show-acks` and `--clear-acks` for ack management without going through subgraph-export.
 
 **Limitations of the regex baseline.** It catches structured PII patterns; it does not catch named-entity PII ("John Smith, born 3/12/1985, lives at 123 Main St"), inferred PII (combined-data risk), or context-sensitive disambiguation (a paper that *quotes* an example email vs *publishes* a contact email). For these cases use the optional Presidio gate below.
 

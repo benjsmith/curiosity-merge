@@ -30,7 +30,13 @@ Most curiosity-engine vaults hold sources whose copyright doesn't belong to the 
 
 When a receiver merges, source stubs whose vault files weren't shipped get tagged `vault_missing: true` with provenance. `hydrate_vault.py` walks those stubs, categorizes by URL (arxiv / preprint / open_access / paywalled / unknown), and re-acquires what it can with per-source confirmation. AlphaXiv-preferred for arXiv when installed.
 
-**Pre-flight detectors** run on every `subgraph-export` before write: chain-merge contamination (non-native pages excluded by default), quote-density lint, license-consistency check, GPL contagion, GDPR-likely PII (regex+density baseline), URL redaction. Each finding has a `severity` (`info`/`warn`/`block`); info-only findings proceed without prompt, warn/block prompt for confirmation. The user accepts (`--yes`), refuses (`--strict`), or skips (`--no-preflight`).
+**Pre-flight detectors** run on every `subgraph-export` before write: chain-merge contamination (non-native pages excluded by default), quote-density (single-source + page-level thresholds), license-consistency (open-license-on-paywalled-URL warn + restrictive-license-on-OA-URL info), GPL contagion, GDPR-likely PII (regex+density baseline), URL redaction. Each finding has a `severity` (`info`/`warn`/`block`); info-only findings proceed without prompt.
+
+**Gating policy** (v0.4.0+): `--refuse-on=VALUE` and `--accept-on=VALUE` each accept `all`, `none` (default), or a comma-separated kind list. Carve-out (`--refuse-on=all --accept-on=quote_density`) and carve-in (`--refuse-on=gpl_contagion --accept-on=all`) are intuitive. Conflicts error at parse time. Deprecated aliases: `--strict` and `--yes` for backwards compat.
+
+**Persistent acks**: `--remember-acks` persists accepted findings to `.curator/preflight-acks.json`; subsequent runs auto-suppress unchanged findings. Interactive prompt is `[y/N/a]` where `a` = yes-and-remember. `--list-acks` / `--clear-acks` for management.
+
+**Standalone audit**: `uv run python3 <skill_path>/scripts/preflight.py --workspace .` for a read-only CI-friendly audit (exit codes: 0 clean / 1 warn+ / 2 error; `--json` mode for machine output).
 
 **Optional `--enable-presidio`** (v0.3.0+): Microsoft Presidio's local NER+ML pass replaces the regex GDPR detector. Catches PERSON names, LOCATION, structured IDs (driver license, passport, medical license), and GDPR special-category data (NRP). All analysis local; no content leaves the machine. Install: `uv pip install presidio-analyzer && uv run python -m spacy download en_core_web_lg` (~500MB; `setup.sh` offers this prompt). Per-file result cache at `.curator/.preflight-cache/`.
 

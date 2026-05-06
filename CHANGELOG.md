@@ -1,5 +1,104 @@
 # Changelog
 
+## v0.4.0 — 2026-05-06
+
+Per-detector gating, persistent finding acks, license-symmetry, per-
+citation quote density, and a real standalone audit CLI. The bundle
+addresses the medium-priority items from the v0.3.0 critical-review
+backlog.
+
+### Per-detector gating policy
+
+- **New `--refuse-on=VALUE` and `--accept-on=VALUE`** on `subgraph_export.py`.
+  Each takes `all`, `none` (default), or a comma-separated kind list.
+  Per-finding resolution: specific-kind in accept_on → accept; specific-
+  kind in refuse_on → refuse; else `all` settings; else prompt.
+  Contradictions (same kind in both CSVs, both `all`, unknown kind name,
+  empty value) error at parse time.
+- **Deprecated aliases**: `--strict` → `--refuse-on=all`,
+  `--yes` → `--accept-on=all`. Still work; one-line stderr deprecation
+  note when used. Mutually exclusive with their replacements.
+- New `preflight.GatingPolicy` class encapsulates the resolution rule
+  (testable in isolation; 11 unit tests).
+
+### Persistent finding acks
+
+- **`.curator/preflight-acks.json`** stores accepted findings keyed by
+  sha256(file_sha256 + kind + summary). File-content drift invalidates
+  acks naturally — re-review forced when the underlying content
+  changes, no special handling needed.
+- **Interactive prompt**: `[y/N/a]`. `a` = yes-and-remember.
+- **`--remember-acks`** persists every accepted finding (whether via
+  `--accept-on` or interactive `y`).
+- Management: `--list-acks` and `--clear-acks` (interactive confirm
+  unless paired with `--accept-on=all`).
+- **Manifest-safe storage**: samples never persisted to the ack file.
+  Verified by test: scan ack-file bytes for `@`, SSN, IBAN patterns
+  → zero matches.
+
+### License-consistency symmetry
+
+- `check_license_consistency` now also flags **(restrictive license +
+  URL on known OA domain)** as `info` severity. The user is being more
+  conservative than necessary; nothing leaks; but the tag is probably
+  wrong and they'd want to know.
+- New `_OA_DOMAINS` list: arxiv, biorxiv, chemrxiv, medrxiv, plos, pmc,
+  europepmc, openreview, aclanthology, doaj.
+- Carve-out for arXiv URLs with empty license tag (the platform default
+  is implicit; firing on every academic vault file would be noise).
+
+### Quote-density per-citation
+
+- Walk page in document order, attribute each block-quote to the
+  nearest preceding `(vault:X)` citation.
+- **Two thresholds, two findings**: `--quote-density-threshold` (single-
+  source, default 0.25) and `--quote-density-page-threshold` (aggregate,
+  default 0.50). Both warn-level. A page can produce both.
+- Single-source finding uses the citation as `subject`, helping users
+  see *which source* is over-quoted.
+- Unattributed quotes (before any citation) bucketed separately with
+  `(unattributed quotes)` subject label.
+
+### Standalone preflight CLI
+
+- **`preflight.py` is now a real audit command.** Read-only: never
+  writes the export cache or ack file (those side effects belong to
+  subgraph-export, not a one-shot audit).
+- Full flag surface: `--workspace`, `--scope`, `--enable-presidio`,
+  density thresholds, `--include-non-native`, `--show-acks`,
+  `--clear-acks`, `--no-samples`, `--json`.
+- **Exit codes for CI**: `0` clean or info-only, `1` any warn/block,
+  `2` operational error.
+- `--json` mode is always manifest-safe (samples never serialised).
+
+### Tests
+
+- 129 active tests passing (was 73 at start of v0.4.0, 81 at end of
+  v0.3.0). 48 new across:
+  - GatingPolicy unit tests (11): default/all/CSV/carve-in/carve-out/
+    info-passthrough/conflict-overlap/conflict-double-all/unknown-kind/
+    empty-value.
+  - Per-citation quote density (4): attribution, unattributed bucket,
+    page-level independent fire, clean-page no-fires.
+  - License symmetry (3): reverse direction is info, arxiv-empty
+    carve-out, no-url no-finding.
+  - Ack store (8): id stability, save/load roundtrip, missing/corrupt
+    file handling, attach_ack_ids, filter_acked, samples-not-persisted,
+    content-drift invalidation.
+  - Per-detector flags integration (8): refuse-on blocks, accept-on
+    proceeds, refuse-on-other-kind doesn't block, carve-out works,
+    deprecated aliases work + emit notice, conflict errors at parse,
+    unknown kind errors at parse.
+  - Ack persistence integration (5): roundtrip, content-change
+    invalidation, samples never on disk, --list-acks, --clear-acks.
+  - Standalone CLI (7): clean=0, findings=1, no-wiki=2, JSON strips
+    samples, --scope filters, --show-acks empty, no cache writes.
+
+### Documentation
+
+- `docs/licensing.md` — new sections on gating policy, ack lifecycle,
+  standalone audit. v0.3.0 sections reformatted to fit alongside.
+
 ## v0.3.0 — 2026-05-05
 
 Optional Microsoft Presidio integration for ML-based PII detection

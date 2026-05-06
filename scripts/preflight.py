@@ -189,11 +189,67 @@ def find_non_native_pages(scope_pages: list[Path]) -> list[dict]:
 # --- 2. quote-density lint ------------------------------------------------
 
 
-_BLOCKQUOTE_RE = re.compile(r"^>+\s?(.*)$", re.MULTILINE)
+_BLOCKQUOTE_LINE_RE = re.compile(r"^>+\s?.*$", re.MULTILINE)
+_CITATION_INLINE_RE = re.compile(r"\(vault:([^)]+)\)")
+
+
+def _attribute_blockquotes(body: str) -> tuple[dict[str, int], int]:
+    """Walk page body in document order, attributing each block-quote
+    line to the nearest preceding `(vault:X)` citation. Returns:
+      ({citation_path → quoted_chars}, total_quoted_chars)
+
+    Blockquotes that appear before any citation in the page go into the
+    `__unattributed__` bucket. Attribution scope is the entire page —
+    a citation at the top of the page captures every subsequent
+    blockquote until the next citation, which fits the common pattern
+    of `## Vaswani 2017\\n(vault:...)\\n\\n> long quote` regardless of
+    section/paragraph boundaries.
+    """
+    by_citation: dict[str, int] = {}
+    # Build sorted list of (offset, kind, value):
+    #   kind="cite" → value is the citation path
+    #   kind="bq"   → value is the line length
+    events: list[tuple[int, str, object]] = []
+    for m in _CITATION_INLINE_RE.finditer(body):
+        events.append((m.start(), "cite", m.group(1).strip()))
+    for m in _BLOCKQUOTE_LINE_RE.finditer(body):
+        events.append((m.start(), "bq", len(m.group(0))))
+    events.sort(key=lambda e: (e[0], 0 if e[1] == "cite" else 1))
+
+    current_citation = "__unattributed__"
+    total = 0
+    for _, kind, value in events:
+        if kind == "cite":
+            current_citation = str(value)
+        else:  # bq
+            length = int(value)  # type: ignore[arg-type]
+            by_citation[current_citation] = (
+                by_citation.get(current_citation, 0) + length
+            )
+            total += length
+    return by_citation, total
 
 
 def measure_quote_density(scope_pages: list[Path],
-                           threshold: float = 0.25) -> list[dict]:
+                           threshold: float = 0.25,
+                           page_threshold: float = 0.50) -> list[dict]:
+    """Two thresholds, two finding kinds:
+
+    1. **Single-source concentration** — any one citation (or the
+       unattributed bucket) contributes >= `threshold` of the page
+       body. Subject is the citation path; one finding per offending
+       citation per page. This catches `>25% from a single paper` even
+       on a page with mixed sources where the page-level total looks
+       fine.
+
+    2. **Page-level aggregate** — total quoted chars >= `page_threshold`
+       of body, across all citations. Subject is the page path. Catches
+       `60% of body is quoted text` regardless of how many sources it's
+       spread across.
+
+    Both are warn-level. A page can produce both findings on the same
+    run; the user sees them as separate concerns.
+    """
     out: list[dict] = []
     for p in scope_pages:
         try:
@@ -201,24 +257,56 @@ def measure_quote_density(scope_pages: list[Path],
         except OSError:
             continue
         body_len = max(1, len(text.strip()))
-        quoted_len = sum(len(m.group(0)) for m in _BLOCKQUOTE_RE.finditer(text))
-        ratio = quoted_len / body_len
-        if ratio >= threshold:
+        by_citation, total_quoted = _attribute_blockquotes(text)
+
+        # Per-citation findings.
+        for citation, quoted_len in sorted(by_citation.items()):
+            ratio = quoted_len / body_len
+            if ratio < threshold:
+                continue
+            shown_source = (
+                "(unattributed quotes)" if citation == "__unattributed__"
+                else f"vault:{citation}"
+            )
+            out.append({
+                "kind": "quote_density",
+                "severity": "warn",
+                "subject": f"{p} — {shown_source}",
+                "summary": (
+                    f"{ratio:.0%} of {p.name} body block-quoted from "
+                    f"{shown_source}"
+                ),
+                "rationale": (
+                    "A wiki page that quotes heavily from a single "
+                    "source republishes that source's prose. Fair-use "
+                    "analysis is jurisdiction-specific; review whether "
+                    "your quotation is minimal, transformative, and "
+                    "properly attributed before publishing. Single-"
+                    f"source threshold for this warning is {threshold:.0%}."
+                ),
+                "samples": [],  # quoted text not sampled — published anyway
+            })
+
+        # Page-level aggregate finding (independent of single-source).
+        page_ratio = total_quoted / body_len
+        if page_ratio >= page_threshold:
             out.append({
                 "kind": "quote_density",
                 "severity": "warn",
                 "subject": str(p),
-                "summary": f"{ratio:.0%} of body inside block quotes",
-                "rationale": (
-                    "When a wiki page is mostly quoted source text, "
-                    "republishing it (even without the source PDF) can be "
-                    "a republication of the publisher's prose. Fair use "
-                    "analysis is jurisdiction-specific; review whether "
-                    "your quotations are minimal, transformative, and "
-                    "properly attributed before publishing. Threshold for "
-                    f"this warning is {threshold:.0%}."
+                "summary": (
+                    f"{page_ratio:.0%} of body block-quoted "
+                    f"(across all sources)"
                 ),
-                "samples": [],  # ratio is in summary; no need to leak quoted text
+                "rationale": (
+                    "Even when no single source dominates, a page that "
+                    "is mostly quoted text from many sources is still "
+                    "mostly quoted text. Review whether the user's own "
+                    "synthesis is sufficient or whether the page is "
+                    "essentially a quotation collage. Page-level "
+                    f"threshold for this warning is {page_threshold:.0%}."
+                ),
+                "samples": [],
             })
     return out
 
@@ -231,6 +319,26 @@ _PAYWALLED_DOMAINS = (
     "wiley.com", "ieee.org", "acm.org", "cell.com", "tandfonline.com",
     "sagepub.com", "jstor.org",
 )
+# Known open-access publisher domains. The reverse check (restrictive
+# license declared + URL on one of these) flags as info-severity: the
+# user is being more conservative than necessary, the tag is probably
+# wrong. Conservative list — better to miss than to be wrong about
+# whether something is OA.
+_OA_DOMAINS = (
+    "arxiv.org", "biorxiv.org", "chemrxiv.org", "medrxiv.org",
+    "plos.org",
+    "ncbi.nlm.nih.gov/pmc", "europepmc.org",
+    "openreview.net", "aclanthology.org",
+    "doaj.org",
+)
+# Tokens that signal "the author hasn't declared an open license" or
+# explicitly restrictive. Empty string also counts (no `license:`
+# field at all).
+_RESTRICTIVE_LICENSE_TOKENS = {
+    "", "all-rights-reserved", "all rights reserved",
+    "proprietary", "copyrighted", "©", "(c)", "unknown",
+    "none", "n/a",
+}
 # Open licenses that permit unrestricted redistribution. NOTE (v0.2.1):
 # CC-BY-NC and CC-BY-ND have been removed from the default list. NC
 # forbids commercial use; ND forbids derivatives. The wiki's normal
@@ -255,9 +363,33 @@ _NC_ND_TOKENS = {
 }
 
 
+def _domain_match(source_url: str, domains: tuple[str, ...]) -> str | None:
+    """Return the matching domain string, or None."""
+    for dom in domains:
+        if dom in source_url:
+            return dom
+    return None
+
+
 def check_license_consistency(vault_files: list[Path]) -> list[dict]:
     """Flag vault files whose declared license disagrees with the
-    publisher domain in their source_url."""
+    publisher domain in their `source_url`.
+
+    Two directions:
+
+    1. **Open license + paywalled domain** (warn, the riskier case).
+       Declared CC-BY etc. but URL is on Nature/Elsevier/Wiley/etc.
+       Either the URL is mislabeled or the license tag is wrong; with
+       --include-vault=owned this file would be shipped under a
+       potentially incorrect entitlement.
+
+    2. **Restrictive license + OA domain** (info, the safer case).
+       Declared `all-rights-reserved` or no license at all, but URL
+       is on arXiv/PLOS/PMC/etc. The user is being more conservative
+       than necessary; nothing leaks, but the tag is probably wrong.
+       Surfacing as info lets them fix the metadata without gating
+       the export.
+    """
     out: list[dict] = []
     for p in vault_files:
         try:
@@ -266,12 +398,13 @@ def check_license_consistency(vault_files: list[Path]) -> list[dict]:
             continue
         license_str = (fm.get("license") or "").lower().strip()
         source_url = (fm.get("source_url") or "").lower()
-        if not license_str or not source_url:
+        if not source_url:
             continue
-        if license_str not in _OPEN_LICENSE_TOKENS:
-            continue
-        for dom in _PAYWALLED_DOMAINS:
-            if dom in source_url:
+
+        # Direction 1: open license declared + paywalled domain → warn.
+        if license_str in _OPEN_LICENSE_TOKENS:
+            dom = _domain_match(source_url, _PAYWALLED_DOMAINS)
+            if dom:
                 out.append({
                     "kind": "license_inconsistent",
                     "severity": "warn",
@@ -288,9 +421,54 @@ def check_license_consistency(vault_files: list[Path]) -> list[dict]:
                         "wrong and the file should not be bundled. Review "
                         "before publishing."
                     ),
-                    "samples": [],  # license + domain are already in summary
+                    "samples": [],
                 })
-                break
+                continue  # one finding per file
+
+        # Direction 2: restrictive (or absent) license + OA domain → info.
+        # Carve out arxiv-non-exclusive on arXiv: that's the correct,
+        # author-retained license for an arXiv preprint, not a tagging
+        # mistake. Same for biorxiv/chemrxiv/medrxiv URLs without an
+        # explicit license — the platform default is implicit.
+        looks_restrictive = (
+            license_str in _RESTRICTIVE_LICENSE_TOKENS
+            or (license_str
+                and license_str not in _OPEN_LICENSE_TOKENS)
+        )
+        # Don't flag empty-license arXiv URLs — empty is the common case
+        # and "info: probably arxiv-non-exclusive" would fire on every
+        # academic vault file. Restrict the empty-license flag to
+        # paywalled domains (already caught above) or non-preprint OA.
+        if license_str == "" and _domain_match(
+            source_url, ("arxiv.org", "biorxiv.org", "chemrxiv.org",
+                          "medrxiv.org")
+        ):
+            continue
+        if looks_restrictive:
+            dom = _domain_match(source_url, _OA_DOMAINS)
+            if dom:
+                shown_license = license_str if license_str else "(none)"
+                out.append({
+                    "kind": "license_inconsistent",
+                    "severity": "info",
+                    "subject": str(p),
+                    "summary": (
+                        f"declared license `{shown_license}` but URL "
+                        f"domain `{dom}` is open-access"
+                    ),
+                    "rationale": (
+                        "The source URL is on a known open-access "
+                        "publisher, but the license tag is missing or "
+                        "restrictive. Nothing in your export leaks "
+                        "(you're being more conservative than the "
+                        "license requires), but the metadata is "
+                        "probably wrong — fixing it would let "
+                        "--include-vault=owned ship this file. Verify "
+                        "the actual license at the source and update "
+                        "the file's `license:` frontmatter."
+                    ),
+                    "samples": [],
+                })
     return out
 
 
@@ -670,6 +848,267 @@ def find_gdpr_likely_pii(files: list[Path]) -> list[dict]:
     return out
 
 
+# --- known-kind registry + flag parsing (v0.4.0) -------------------------
+
+
+# Authoritative list of detector kinds emitted by run_all(). Used to
+# validate --refuse-on / --accept-on values at argparse time so typos
+# fail loudly instead of silently disabling gating. Update this when
+# adding a new detector.
+KNOWN_FINDING_KINDS = (
+    "non_native_page",
+    "quote_density",
+    "license_inconsistent",
+    "gpl_contagion",
+    "gdpr_likely_pii",
+)
+
+
+class GatingPolicy:
+    """Resolved gating policy from --refuse-on / --accept-on.
+
+    The two value spaces (`all` / `none` / CSV-of-kinds) are compiled
+    here once at startup and consulted per finding. Conflicts (same
+    kind in both refuse and accept CSVs, or both `all`) are caught
+    during construction and raise SystemExit at argparse time so the
+    error surfaces before any work happens.
+    """
+
+    REFUSE = "refuse"
+    ACCEPT = "accept"
+    PROMPT = "prompt"
+
+    def __init__(self, *, refuse_value: str, accept_value: str):
+        self._refuse_all, self._refuse_kinds = self._compile(
+            refuse_value, "refuse-on"
+        )
+        self._accept_all, self._accept_kinds = self._compile(
+            accept_value, "accept-on"
+        )
+        # Conflict 1: same kind in both refuse and accept CSVs.
+        overlap = self._refuse_kinds & self._accept_kinds
+        if overlap:
+            raise SystemExit(
+                "preflight: --refuse-on and --accept-on both contain "
+                f"{sorted(overlap)}. Pick one disposition per kind."
+            )
+        # Conflict 2: both set to all.
+        if self._refuse_all and self._accept_all:
+            raise SystemExit(
+                "preflight: --refuse-on=all and --accept-on=all are "
+                "contradictory. Pick one."
+            )
+        # Carve-out / carve-in cases (e.g. --refuse-on=all
+        # --accept-on=k1) are valid; the resolution rule handles them
+        # via the "more specific wins" preference encoded in decide().
+
+    @staticmethod
+    def _compile(value: str, flag_name: str) -> tuple[bool, set[str]]:
+        """Parse one flag value. Returns (is_all, kind_set).
+
+        - 'none' (default) → (False, set())
+        - 'all' → (True, set())
+        - 'k1,k2,...' → (False, {k1, k2, ...}) with kind validation
+        - empty string → error
+        """
+        v = (value or "").strip()
+        if not v:
+            raise SystemExit(
+                f"preflight: --{flag_name} requires a value "
+                "(`all`, `none`, or a comma-separated kind list)"
+            )
+        if v.lower() == "none":
+            return False, set()
+        if v.lower() == "all":
+            return True, set()
+        kinds = {k.strip() for k in v.split(",") if k.strip()}
+        if not kinds:
+            raise SystemExit(
+                f"preflight: --{flag_name}={value!r} parses to no kinds"
+            )
+        unknown = kinds - set(KNOWN_FINDING_KINDS)
+        if unknown:
+            raise SystemExit(
+                f"preflight: --{flag_name} got unknown kind(s) "
+                f"{sorted(unknown)}. Known kinds: "
+                f"{', '.join(KNOWN_FINDING_KINDS)}"
+            )
+        return False, kinds
+
+    def decide(self, finding: dict) -> str:
+        """Return one of REFUSE / ACCEPT / PROMPT for a single finding.
+
+        Severity gating: info findings are never refused or auto-
+        accepted via the policy — they're treated as prompt-able only,
+        and the caller's normal severity-aware UX (info-only proceeds
+        without prompt) handles them. Refuse/accept apply to warn/block
+        only.
+        """
+        if finding.get("severity") not in ("warn", "block"):
+            return self.PROMPT
+        kind = finding.get("kind", "")
+        # Specific-kind decisions take precedence over `all`. This is
+        # how carve-out (--refuse-on=all --accept-on=k1) and carve-in
+        # (--refuse-on=k1 --accept-on=all) work intuitively.
+        if kind in self._accept_kinds:
+            return self.ACCEPT
+        if kind in self._refuse_kinds:
+            return self.REFUSE
+        if self._refuse_all:
+            return self.REFUSE
+        if self._accept_all:
+            return self.ACCEPT
+        return self.PROMPT
+
+    def is_default(self) -> bool:
+        """True when no gating is configured — every warn/block finding
+        falls through to PROMPT."""
+        return (not self._refuse_all and not self._refuse_kinds
+                and not self._accept_all and not self._accept_kinds)
+
+
+# --- finding ack store (v0.4.0) ------------------------------------------
+
+
+# Persisted at .curator/preflight-acks.json. The ack key is
+# sha256(file_sha256 + kind + summary). File-content drift invalidates
+# acks naturally (the file's sha256 changes). Detector summary changes
+# (e.g. count differs) also invalidate. Both are correct behaviours:
+# the user reviewed a specific situation; if either the content or the
+# detector's reading of it changes, re-review is warranted.
+
+ACK_FILE_NAME = "preflight-acks.json"
+ACK_FILE_SCHEMA_VERSION = 1
+
+
+def ack_id(file_sha256: str, kind: str, summary: str) -> str:
+    """Stable identifier for a (file content, detector kind, summary)
+    triple. Used as the dedup key in the ack store."""
+    payload = "".join((file_sha256, kind, summary))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _ack_path(workspace: Path) -> Path:
+    return workspace / ".curator" / ACK_FILE_NAME
+
+
+def load_acks(workspace: Path) -> dict[str, dict]:
+    """Return acks indexed by ack_id. Empty dict if no ack file or
+    file is corrupt (logged warning, treated as no-acks)."""
+    p = _ack_path(workspace)
+    if not p.is_file():
+        return {}
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        sys.stderr.write(
+            f"preflight: ack file at {p} is unreadable ({e}); "
+            "treating as no-acks. Inspect or delete to clear.\n"
+        )
+        return {}
+    return {entry["ack_id"]: entry
+             for entry in data.get("acks", [])
+             if isinstance(entry, dict) and entry.get("ack_id")}
+
+
+def save_acks(workspace: Path, acks: dict[str, dict]) -> None:
+    """Atomically write the ack store. Best-effort — any write failure
+    is logged but doesn't propagate (the user's export shouldn't fail
+    because we couldn't persist an ack)."""
+    p = _ack_path(workspace)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": ACK_FILE_SCHEMA_VERSION,
+        "acks": sorted(acks.values(), key=lambda a: a.get("acked_at", "")),
+    }
+    try:
+        # Write to a sibling temp file then rename, so a crashed write
+        # doesn't truncate the existing ack file.
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        tmp.replace(p)
+    except OSError as e:
+        sys.stderr.write(
+            f"preflight: failed to persist acks at {p}: {e}\n"
+        )
+
+
+def file_sha256(path: Path) -> str:
+    """sha256 of a file's bytes. Returns empty string on read failure
+    (which causes the ack-key mechanism to skip this file — preferable
+    to silent collisions on '')."""
+    return _file_sha256(path)
+
+
+def attach_ack_ids(findings: list[dict]) -> list[dict]:
+    """Annotate each finding with an `ack_id` field computed from
+    (file sha256 of subject, kind, summary). Returns the same list,
+    mutated in place. Findings with empty subjects are skipped (no
+    ack key)."""
+    for f in findings:
+        subj = f.get("subject", "")
+        # Subjects may include a trailing "— vault:..." marker for
+        # quote_density per-citation findings; the underlying file is
+        # the part before " — ".
+        path_str = subj.split(" — ", 1)[0] if " — " in subj else subj
+        if not path_str:
+            f["ack_id"] = ""
+            continue
+        sha = _file_sha256(Path(path_str))
+        if not sha:
+            f["ack_id"] = ""
+            continue
+        f["ack_id"] = ack_id(sha, f.get("kind", ""), f.get("summary", ""))
+    return findings
+
+
+def filter_acked(findings: list[dict],
+                  acks: dict[str, dict]) -> tuple[list[dict], list[dict]]:
+    """Split findings into (live, suppressed). A finding is suppressed
+    if its `ack_id` is present in the acks dict.
+
+    Caller is expected to have run `attach_ack_ids` first; findings
+    without `ack_id` (no readable subject path) are always live.
+    """
+    live: list[dict] = []
+    suppressed: list[dict] = []
+    for f in findings:
+        aid = f.get("ack_id", "")
+        if aid and aid in acks:
+            suppressed.append(f)
+        else:
+            live.append(f)
+    return live, suppressed
+
+
+def record_ack(acks: dict[str, dict], finding: dict, *,
+                ack_reason: str = "") -> None:
+    """Add a finding to the acks dict (in place). The finding must
+    already have an `ack_id` (via attach_ack_ids). The ack stores
+    only manifest-safe metadata — no samples — so the persisted file
+    can never become a side-channel for matched values.
+    """
+    aid = finding.get("ack_id", "")
+    if not aid:
+        return
+    subj = finding.get("subject", "")
+    path_str = subj.split(" — ", 1)[0] if " — " in subj else subj
+    sha = _file_sha256(Path(path_str)) if path_str else ""
+    import datetime as _dt
+    acks[aid] = {
+        "ack_id": aid,
+        "subject": subj,
+        "file_sha256": sha,
+        "kind": finding.get("kind", ""),
+        "summary": finding.get("summary", ""),
+        "severity": finding.get("severity", ""),
+        "acked_at": _dt.datetime.now(_dt.timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        ),
+        "ack_reason": ack_reason,
+    }
+
+
 # --- aggregate runner + manifest-safety ----------------------------------
 
 
@@ -903,32 +1342,198 @@ def format_findings(findings: list[dict], *, show_samples: bool = True,
 # --- CLI for standalone audits (added v0.2.2; stub here) -----------------
 
 
-if __name__ == "__main__":
-    # Minimal CLI: scan a workspace, print findings, exit 0.
-    # Full CLI surface (--workspace, --scope-pages, etc.) lands in v0.2.2.
+def _cli_main(argv: list[str] | None = None) -> int:
+    """Standalone audit command for preflight.
+
+    Read-only: scans a workspace, prints findings, never writes to the
+    cache or ack store. Subgraph-export and merge are the canonical
+    paths for those side effects; this command is for "does my wiki
+    have any issues right now?" before pushing.
+
+    Exit codes:
+      0 — no findings, or only info-level (clean enough to ship)
+      1 — at least one warn/block finding (suitable for CI gating)
+      2 — operational error (no wiki/, etc.)
+    """
     import argparse
     ap = argparse.ArgumentParser(
         prog="preflight.py",
-        description="Run preflight detectors over a curiosity-engine workspace.",
+        description="Audit a curiosity-engine workspace for licensing / "
+                    "PII / quote-density issues. Read-only; no cache or "
+                    "ack writes (use subgraph_export.py for those).",
     )
-    ap.add_argument("--workspace", default=".")
-    ap.add_argument("--quote-density-threshold", type=float, default=0.25)
+    ap.add_argument("--workspace", default=".",
+                    help="workspace root containing wiki/ and vault/ "
+                         "(default: cwd)")
+    ap.add_argument("--scope", action="append", default=None, metavar="PATH",
+                    help="restrict analysis to these specific files "
+                         "(repeat for multiple). If omitted, scans every "
+                         "file under wiki/ and vault/.")
+    ap.add_argument("--include-non-native", action="store_true",
+                    help="include pages with origin: tags in scope "
+                         "(default: included for audit, since the user "
+                         "wants to see the full picture)")
+    ap.add_argument("--quote-density-threshold", type=float, default=0.25,
+                    help="single-source quote density threshold (default 0.25)")
+    ap.add_argument("--quote-density-page-threshold", type=float, default=0.50,
+                    help="page-level aggregate quote density threshold "
+                         "(default 0.50)")
+    ap.add_argument("--enable-presidio", action="store_true",
+                    help="run Microsoft Presidio (NER + ML PII detection) "
+                         "instead of the regex baseline. Requires "
+                         "presidio-analyzer installed.")
+    ap.add_argument("--presidio-entities", default="", metavar="CSV",
+                    help="Presidio entity types (default: curated PII set)")
+    ap.add_argument("--presidio-confidence", type=float, default=0.6,
+                    help="Presidio score threshold (default 0.6)")
+    ap.add_argument("--show-acks", action="store_true",
+                    help="print the workspace ack table and exit")
+    ap.add_argument("--clear-acks", action="store_true",
+                    help="clear the ack file (with --confirm-clear)")
+    ap.add_argument("--confirm-clear", action="store_true",
+                    help="auto-confirm --clear-acks (no prompt; use in scripts)")
     ap.add_argument("--no-samples", action="store_true",
-                    help="omit local-only sample values (manifest-safe view)")
-    args = ap.parse_args()
+                    help="omit local-only sample values from output "
+                         "(manifest-safe view; useful for sharing audit "
+                         "logs with collaborators without leaking values)")
+    ap.add_argument("--json", dest="as_json", action="store_true",
+                    help="emit findings as JSON (manifest-safe; samples "
+                         "are always stripped in this mode)")
+    args = ap.parse_args(argv)
+
     ws = Path(args.workspace).resolve()
+
+    # Management modes short-circuit.
+    if args.show_acks:
+        acks = load_acks(ws)
+        if args.as_json:
+            sys.stdout.write(json.dumps(
+                list(acks.values()), indent=2, sort_keys=True,
+            ) + "\n")
+        else:
+            if not acks:
+                sys.stdout.write(f"preflight: no acks at {ws}\n")
+            else:
+                sys.stdout.write(f"preflight: {len(acks)} ack(s):\n\n")
+                for entry in sorted(acks.values(),
+                                     key=lambda a: a.get("acked_at", "")):
+                    for k in ("ack_id", "subject", "kind",
+                               "summary", "acked_at"):
+                        sys.stdout.write(
+                            f"  {k:9}: {entry.get(k, '')}\n"
+                        )
+                    sys.stdout.write("\n")
+        return 0
+
+    if args.clear_acks:
+        ack_path = ws / ".curator" / ACK_FILE_NAME
+        if not ack_path.is_file():
+            sys.stdout.write(f"preflight: nothing to clear at {ack_path}\n")
+            return 0
+        n = len(load_acks(ws))
+        if not args.confirm_clear:
+            if not sys.stdin.isatty():
+                sys.stderr.write(
+                    f"preflight: would clear {n} ack(s); pass "
+                    "--confirm-clear to proceed.\n"
+                )
+                return 2
+            sys.stdout.write(f"Clear {n} ack(s) at {ack_path}? [y/N] ")
+            sys.stdout.flush()
+            ans = (sys.stdin.readline() or "").strip().lower()
+            if ans not in ("y", "yes"):
+                sys.stdout.write("preflight: cancelled\n")
+                return 0
+        try:
+            ack_path.unlink()
+        except OSError as e:
+            sys.stderr.write(f"preflight: could not remove {ack_path}: {e}\n")
+            return 2
+        sys.stdout.write(f"preflight: cleared {n} ack(s)\n")
+        return 0
+
+    # Audit mode.
     wiki = ws / "wiki"
     vault = ws / "vault"
     if not wiki.is_dir():
-        sys.stderr.write(f"no wiki/ at {ws}\n")
-        sys.exit(2)
-    pages = [p for p in wiki.rglob("*.md")
-              if not any(s.startswith(".") for s in p.relative_to(wiki).parts)]
-    vfs = [p for p in vault.rglob("*")
-            if p.is_file()
-            and not any(s.startswith(".") for s in p.relative_to(vault).parts)] \
-            if vault.is_dir() else []
-    findings = run_all(scope_pages=pages, vault_files=vfs,
-                        quote_density_threshold=args.quote_density_threshold)
-    sys.stdout.write(format_findings(findings, show_samples=not args.no_samples))
-    sys.exit(0)
+        sys.stderr.write(f"preflight: no wiki/ at {ws}\n")
+        return 2
+
+    if args.scope:
+        scope_pages = []
+        scope_vault = []
+        for raw in args.scope:
+            p = Path(raw).resolve()
+            if not p.is_file():
+                sys.stderr.write(f"preflight: not a file: {raw}\n")
+                return 2
+            try:
+                rel = p.relative_to(wiki)
+                scope_pages.append(p)
+                continue
+            except ValueError:
+                pass
+            try:
+                rel = p.relative_to(vault) if vault.is_dir() else None
+                if rel is not None:
+                    scope_vault.append(p)
+                    continue
+            except ValueError:
+                pass
+            sys.stderr.write(
+                f"preflight: {raw} is not inside wiki/ or vault/\n"
+            )
+            return 2
+        pages = scope_pages
+        vfs = scope_vault
+    else:
+        pages = [p for p in wiki.rglob("*.md")
+                  if not any(s.startswith(".")
+                              for s in p.relative_to(wiki).parts)]
+        vfs = ([p for p in vault.rglob("*")
+                if p.is_file()
+                and not any(s.startswith(".")
+                             for s in p.relative_to(vault).parts)]
+               if vault.is_dir() else [])
+
+    presidio_entities = (
+        tuple(e.strip() for e in args.presidio_entities.split(",")
+              if e.strip())
+        if args.presidio_entities else None
+    )
+    findings = run_all(
+        scope_pages=pages, vault_files=vfs,
+        include_non_native=args.include_non_native,
+        quote_density_threshold=args.quote_density_threshold,
+        enable_presidio=args.enable_presidio,
+        presidio_entities=presidio_entities,
+        presidio_confidence=args.presidio_confidence,
+        cache_dir=None,  # read-only audit; never write the export cache
+    )
+
+    # Apply existing acks (read-only: never persist new acks here).
+    acks = load_acks(ws)
+    attach_ack_ids(findings)
+    findings, suppressed = filter_acked(findings, acks)
+    if suppressed and not args.as_json:
+        sys.stderr.write(
+            f"preflight: {len(suppressed)} finding(s) suppressed by "
+            "previous acks\n"
+        )
+
+    if args.as_json:
+        # JSON mode: always manifest-safe (samples never serialised).
+        payload = [manifest_safe(f) for f in findings]
+        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write(format_findings(
+            findings, show_samples=not args.no_samples,
+        ))
+
+    # Exit code: 0 on clean/info-only, 1 on any warn/block.
+    has_warn = any(f.get("severity") in ("warn", "block") for f in findings)
+    return 1 if has_warn else 0
+
+
+if __name__ == "__main__":
+    sys.exit(_cli_main())

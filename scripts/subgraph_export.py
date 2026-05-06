@@ -461,6 +461,63 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
     )
 
 
+# --- ack management commands --------------------------------------------
+
+
+def _cmd_list_acks(workspace: Path) -> int:
+    """Print the current ack table. Returns 0 always."""
+    acks = preflight.load_acks(workspace)
+    if not acks:
+        sys.stdout.write(
+            f"preflight: no acks at "
+            f"{workspace / '.curator' / preflight.ACK_FILE_NAME}\n"
+        )
+        return 0
+    sys.stdout.write(f"preflight: {len(acks)} ack(s):\n\n")
+    for entry in sorted(acks.values(), key=lambda a: a.get("acked_at", "")):
+        sys.stdout.write(
+            f"  ack_id  : {entry.get('ack_id', '')}\n"
+            f"  subject : {entry.get('subject', '')}\n"
+            f"  kind    : {entry.get('kind', '')}\n"
+            f"  summary : {entry.get('summary', '')}\n"
+            f"  acked_at: {entry.get('acked_at', '')}\n"
+        )
+        if entry.get("ack_reason"):
+            sys.stdout.write(f"  reason  : {entry['ack_reason']}\n")
+        sys.stdout.write("\n")
+    return 0
+
+
+def _cmd_clear_acks(workspace: Path, *, auto_yes: bool) -> int:
+    """Clear all acks. Prompts unless `auto_yes`."""
+    p = workspace / ".curator" / preflight.ACK_FILE_NAME
+    if not p.is_file():
+        sys.stdout.write(f"preflight: no ack file at {p}; nothing to clear\n")
+        return 0
+    acks = preflight.load_acks(workspace)
+    sys.stdout.write(
+        f"preflight: this will clear {len(acks)} ack(s) at {p}.\n"
+    )
+    if not auto_yes:
+        if not sys.stdin.isatty():
+            raise SystemExit(
+                "preflight: --clear-acks needs confirmation but no TTY. "
+                "Pass --accept-on=all to auto-confirm in scripts."
+            )
+        sys.stdout.write("Continue? [y/N] ")
+        sys.stdout.flush()
+        ans = (sys.stdin.readline() or "").strip().lower()
+        if ans not in ("y", "yes"):
+            sys.stdout.write("preflight: clear-acks cancelled\n")
+            return 0
+    try:
+        p.unlink()
+    except OSError as e:
+        raise SystemExit(f"preflight: failed to remove {p}: {e}")
+    sys.stdout.write(f"preflight: cleared {len(acks)} ack(s)\n")
+    return 0
+
+
 # --- entry point -----------------------------------------------------------
 
 
@@ -469,7 +526,10 @@ def main(argv: list[str] | None = None) -> int:
         prog="subgraph_export.py",
         description="Extract a self-contained mini-wiki from a curiosity-engine workspace.",
     )
-    scope = ap.add_mutually_exclusive_group(required=True)
+    # scope and --to are required for export, but optional for the
+    # management commands (--list-acks / --clear-acks) which need only
+    # --workspace. Validation happens in main() once we know the mode.
+    scope = ap.add_mutually_exclusive_group(required=False)
     scope.add_argument("--project", metavar="NAME",
                        help="export pages tagged projects: [NAME]")
     scope.add_argument("--page", metavar="STEM",
@@ -478,7 +538,7 @@ def main(argv: list[str] | None = None) -> int:
                        help="export pages tagged origin: NAME")
     ap.add_argument("--include-1-hop", action="store_true",
                     help="for --page, also include wikilink neighbors (1 hop)")
-    ap.add_argument("--to", metavar="PATH", required=True,
+    ap.add_argument("--to", metavar="PATH", required=False, default=None,
                     help="destination directory (must not exist or must be empty)")
     ap.add_argument("--workspace", metavar="PATH", default=".",
                     help="curiosity-engine workspace root (default: cwd)")
@@ -508,12 +568,40 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--quote-density-threshold", type=float, default=0.25,
                     help="warn when a wiki page is >= this fraction of "
                          "block-quoted source text (default: 0.25)")
+    ap.add_argument("--refuse-on", default="none", metavar="VALUE",
+                    help="when a warn/block finding causes the export to "
+                         "refuse. Value: `all` (any kind), `none` (default; "
+                         "fall through to prompt), or a comma-separated "
+                         "kind list (e.g. `quote_density,gpl_contagion`). "
+                         "Conflicts with --accept-on for the same kind "
+                         "error at parse time.")
+    ap.add_argument("--accept-on", default="none", metavar="VALUE",
+                    help="when a warn/block finding is auto-accepted "
+                         "without prompt. Same value space as --refuse-on. "
+                         "Carve-out: --refuse-on=all --accept-on=k accepts "
+                         "kind k while refusing everything else. Carve-in: "
+                         "--refuse-on=k --accept-on=all is the inverse.")
+    ap.add_argument("--remember-acks", action="store_true",
+                    help="when an export accepts a finding (via "
+                         "--accept-on, the interactive `a` choice, or "
+                         "deprecated --ack-all), persist it to "
+                         ".curator/preflight-acks.json so the same "
+                         "finding is auto-suppressed on subsequent runs. "
+                         "Acks are keyed by file sha256 + kind + summary; "
+                         "any content drift invalidates the ack and "
+                         "forces re-review.")
+    ap.add_argument("--list-acks", action="store_true",
+                    help="print the current ack table and exit (no export)")
+    ap.add_argument("--clear-acks", action="store_true",
+                    help="clear the ack file and exit (no export). "
+                         "Prompts for confirmation unless paired with "
+                         "--accept-on=all.")
+    # Deprecated convenience aliases (v0.2.x / v0.3.x). Resolved into
+    # the new --refuse-on / --accept-on values during arg processing.
     ap.add_argument("--yes", action="store_true",
-                    help="auto-accept preflight findings and proceed "
-                         "(non-interactive). Otherwise: prompt y/N when "
-                         "interactive, refuse when not.")
+                    help="DEPRECATED: equivalent to --accept-on=all")
     ap.add_argument("--strict", action="store_true",
-                    help="refuse to proceed if any preflight detector fires")
+                    help="DEPRECATED: equivalent to --refuse-on=all")
     ap.add_argument("--no-preflight", action="store_true",
                     help="skip all preflight checks (not recommended)")
     ap.add_argument("--include-preflight-in-manifest", action="store_true",
@@ -562,6 +650,21 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(f"no wiki/ at {workspace}")
     if not vault_dir.is_dir():
         raise SystemExit(f"no vault/ at {workspace}")
+
+    # --list-acks / --clear-acks short-circuit before any export work.
+    if args.list_acks:
+        return _cmd_list_acks(workspace)
+    if args.clear_acks:
+        return _cmd_clear_acks(workspace, auto_yes=args.accept_on == "all")
+
+    # Below here, we're doing an export — scope and --to are required.
+    if not (args.project or args.page or args.origin):
+        raise SystemExit(
+            "must pass one of --project / --page / --origin "
+            "(or --list-acks / --clear-acks for ack management)"
+        )
+    if not args.to:
+        raise SystemExit("--to PATH is required for export")
 
     dest = _safe_destination(args.to, workspace)
     if dest.exists() and any(dest.iterdir()) and not args.force:
@@ -633,19 +736,47 @@ def main(argv: list[str] | None = None) -> int:
 
     # Pre-flight: run detectors on what we're about to ship.
     #
-    # Severity-aware UX (v0.2.1.1):
-    #   - info-only findings  → one-line stderr ack, no prompt, proceed
-    #     (typical for academic content with sparse author-block emails)
-    #   - warn / block        → show full findings, prompt y/N (or refuse
-    #                            in --strict / non-interactive without --yes)
-    #
-    # Why: density-aware GDPR detection produces a lot of info-level hits
-    # on real academic vault content (corresponding-author emails inside
-    # FETCHED CONTENT markers). Those are published-by-consent and should
-    # not interrupt the export flow. Real concerns (warn/block) still
-    # require deliberate confirmation.
+    # Gating model (v0.4.0):
+    #   - --refuse-on / --accept-on define a per-kind policy
+    #   - For each warn/block finding the policy returns REFUSE,
+    #     ACCEPT, or PROMPT
+    #   - REFUSE → export fails immediately
+    #   - ACCEPT → no prompt, proceed
+    #   - PROMPT → interactive y/N (refuses if no TTY)
+    #   - info findings always fall through with a one-line ack;
+    #     they cannot block (consistent with v0.3.0 severity model)
     findings: list[dict] = []
     if not args.no_preflight:
+        # Resolve deprecated --strict / --yes into the new flag values.
+        # Mutually exclusive with the explicit form: passing both errors.
+        refuse_value = args.refuse_on
+        accept_value = args.accept_on
+        if args.strict:
+            if refuse_value != "none":
+                raise SystemExit(
+                    "preflight: --strict and --refuse-on are mutually "
+                    "exclusive (--strict is the deprecated alias for "
+                    "--refuse-on=all)"
+                )
+            sys.stderr.write(
+                "preflight: --strict is deprecated; use --refuse-on=all\n"
+            )
+            refuse_value = "all"
+        if args.yes:
+            if accept_value != "none":
+                raise SystemExit(
+                    "preflight: --yes and --accept-on are mutually "
+                    "exclusive (--yes is the deprecated alias for "
+                    "--accept-on=all)"
+                )
+            sys.stderr.write(
+                "preflight: --yes is deprecated; use --accept-on=all\n"
+            )
+            accept_value = "all"
+        policy = preflight.GatingPolicy(
+            refuse_value=refuse_value, accept_value=accept_value,
+        )
+
         presidio_entities = (
             tuple(e.strip() for e in args.presidio_entities.split(",")
                   if e.strip())
@@ -663,6 +794,21 @@ def main(argv: list[str] | None = None) -> int:
             presidio_confidence=args.presidio_confidence,
             cache_dir=cache_dir,
         )
+
+        # Apply ack store: any finding whose (file_sha256, kind, summary)
+        # has been acked previously is suppressed and counted in stderr.
+        # Findings come back annotated with `ack_id` for downstream
+        # persistence decisions.
+        acks = preflight.load_acks(workspace)
+        preflight.attach_ack_ids(findings)
+        findings, suppressed = preflight.filter_acked(findings, acks)
+        if suppressed:
+            sys.stderr.write(
+                f"preflight: {len(suppressed)} finding(s) suppressed by "
+                "previous acks (subjects unchanged on disk)\n"
+            )
+
+        # Partition by severity first, then by policy decision.
         info_findings = [f for f in findings if f.get("severity") == "info"]
         warn_findings = [f for f in findings
                           if f.get("severity") in ("warn", "block")]
@@ -675,25 +821,69 @@ def main(argv: list[str] | None = None) -> int:
             )
 
         if warn_findings:
+            decisions = [(f, policy.decide(f)) for f in warn_findings]
+            refused = [f for f, d in decisions if d == policy.REFUSE]
+            accepted_by_policy = [f for f, d in decisions
+                                   if d == policy.ACCEPT]
+            needs_prompt = [f for f, d in decisions if d == policy.PROMPT]
+
+            # Always show the full findings list so the user sees what
+            # was decided regardless of disposition.
             sys.stderr.write(preflight.format_findings(warn_findings))
-            if args.strict:
+
+            if refused:
+                kinds = sorted({f["kind"] for f in refused})
                 raise SystemExit(
-                    "preflight: --strict and warn/block findings present; "
-                    "refusing"
+                    f"preflight: {len(refused)} warn/block finding(s) "
+                    f"refused by policy (kinds: {', '.join(kinds)})"
                 )
-            if not args.yes:
+
+            if accepted_by_policy:
+                kinds = sorted({f["kind"] for f in accepted_by_policy})
+                sys.stderr.write(
+                    f"preflight: {len(accepted_by_policy)} finding(s) "
+                    f"auto-accepted by policy (kinds: {', '.join(kinds)})\n"
+                )
+
+            interactive_acked: list[dict] = []
+            if needs_prompt:
                 if not sys.stdin.isatty():
                     raise SystemExit(
-                        "preflight: warn/block findings present and not "
-                        "interactive (no TTY). Pass --yes to auto-accept, "
-                        "--strict to refuse, or --no-preflight to skip "
-                        "checks."
+                        f"preflight: {len(needs_prompt)} warn/block "
+                        "finding(s) need decision and not interactive "
+                        "(no TTY). Pass --accept-on=<kinds> / "
+                        "--refuse-on=<kinds> for per-kind policy, or "
+                        "--no-preflight to skip checks."
                     )
-                sys.stderr.write("Continue with export? [y/N] ")
+                sys.stderr.write(
+                    f"Continue with export? "
+                    f"({len(needs_prompt)} unhandled finding(s)) "
+                    "[y/N/a]  "
+                    "(y=yes for this run, N=refuse, "
+                    "a=yes and remember as ack) "
+                )
                 sys.stderr.flush()
                 ans = (sys.stdin.readline() or "").strip().lower()
-                if ans not in ("y", "yes"):
+                if ans in ("a", "ack"):
+                    interactive_acked = list(needs_prompt)
+                elif ans not in ("y", "yes"):
                     raise SystemExit("preflight: declined by user")
+
+            # Persist acks for: --remember-acks-flagged accepted findings,
+            # AND interactive `a` choices. Suppressed findings already
+            # have acks, no need to re-record.
+            if args.remember_acks or interactive_acked:
+                to_record: list[dict] = list(interactive_acked)
+                if args.remember_acks:
+                    to_record.extend(accepted_by_policy)
+                if to_record:
+                    for f in to_record:
+                        preflight.record_ack(acks, f)
+                    preflight.save_acks(workspace, acks)
+                    sys.stderr.write(
+                        f"preflight: persisted {len(to_record)} new "
+                        f"ack(s) to .curator/{preflight.ACK_FILE_NAME}\n"
+                    )
 
     dest_wiki = dest / "wiki"
     dest_vault = dest / "vault"

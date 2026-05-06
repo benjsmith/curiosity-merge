@@ -523,6 +523,449 @@ def test_export_noninteractive_without_yes_refuses_on_findings(
     assert res.returncode != 0
 
 
+# --- standalone preflight CLI (v0.4.0) -----------------------------------
+
+
+def test_preflight_cli_clean_workspace_exits_zero(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-clean"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        "Pure prose with no PII or quotes.\n"
+    )
+    res = run_script(
+        "preflight.py", "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert res.returncode == 0
+    assert "no issues" in res.stdout
+
+
+def test_preflight_cli_findings_exit_one(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-find"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "preflight.py", "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode == 1
+    assert "quote_density" in res.stdout
+
+
+def test_preflight_cli_no_wiki_exits_two(env_with_ce, tmp_path: Path):
+    res = run_script(
+        "preflight.py", "--workspace", str(tmp_path / "nope"),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode == 2
+    assert "no wiki" in (res.stderr + res.stdout)
+
+
+def test_preflight_cli_json_output_strips_samples(
+        env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-json"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        "Author email: alice@somecompany.com.\n"
+    )
+    res = run_script(
+        "preflight.py", "--workspace", str(ws), "--json",
+        env=env_with_ce, check=False,
+    )
+    payload = json.loads(res.stdout)
+    assert isinstance(payload, list)
+    # No sample values in any finding.
+    assert "alice@somecompany.com" not in res.stdout
+    for f in payload:
+        assert "samples" not in f
+
+
+def test_preflight_cli_scope_restricts_to_specific_files(
+        env_with_ce, tmp_path: Path):
+    """--scope should limit analysis to listed files, ignoring others."""
+    ws = tmp_path / "ws-scope"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    clean = ws / "wiki" / "concepts" / "clean.md"
+    clean.write_text(
+        "---\ntitle: clean\ntype: concept\nprojects: [p]\n---\nNo issues.\n"
+    )
+    dirty = ws / "wiki" / "concepts" / "dirty.md"
+    dirty.write_text(
+        "---\ntitle: dirty\ntype: concept\nprojects: [p]\n---\n"
+        "(vault:src.md)\n\n"
+        + "> heavy quote\n" * 30
+    )
+    (ws / "vault" / "src.md").write_text(
+        "---\ntitle: x\nsource_url: https://arxiv.org/x\n---\n"
+    )
+    # Scope only `clean` → no findings.
+    res = run_script(
+        "preflight.py", "--workspace", str(ws),
+        "--scope", str(clean),
+        env=env_with_ce,
+    )
+    assert res.returncode == 0
+    # Scope only `dirty` → quote_density fires.
+    res2 = run_script(
+        "preflight.py", "--workspace", str(ws),
+        "--scope", str(dirty),
+        env=env_with_ce, check=False,
+    )
+    assert res2.returncode == 1
+
+
+def test_preflight_cli_show_acks_empty(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "preflight.py", "--workspace", str(ws), "--show-acks",
+        env=env_with_ce,
+    )
+    assert "no acks" in res.stdout
+
+
+def test_preflight_cli_does_not_write_cache(env_with_ce, tmp_path: Path):
+    """Read-only audit: scanning a workspace must not create the
+    Presidio cache directory or the ack file."""
+    ws = tmp_path / "ws-readonly"
+    _build_quote_density_only_fixture(ws)
+    cache_dir = ws / ".curator" / ".preflight-cache"
+    ack_file = ws / ".curator" / "preflight-acks.json"
+    run_script(
+        "preflight.py", "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert not cache_dir.exists()
+    assert not ack_file.exists()
+
+
+# --- persistent finding acks (v0.4.0) ------------------------------------
+
+
+def test_remember_acks_persists_and_suppresses_next_run(
+        env_with_ce, tmp_path: Path):
+    """First run with --accept-on=quote_density --remember-acks
+    persists the ack. Second run without --accept-on auto-suppresses
+    the same finding."""
+    ws = tmp_path / "ws"
+    _build_quote_density_only_fixture(ws)
+    out1 = tmp_path / "out1"
+    res1 = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out1),
+        "--accept-on", "quote_density",
+        "--remember-acks",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert "persisted" in res1.stderr
+    ack_file = ws / ".curator" / "preflight-acks.json"
+    assert ack_file.is_file()
+    acks = json.loads(ack_file.read_text())
+    assert len(acks["acks"]) >= 1
+    # Second run: no --accept-on, but ack should suppress.
+    out2 = tmp_path / "out2"
+    res2 = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out2),
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert "suppressed by previous acks" in res2.stderr
+    assert (out2 / "_export-manifest.json").is_file()
+
+
+def test_acks_invalidated_by_file_content_change(
+        env_with_ce, tmp_path: Path):
+    """After acking a finding, edit the underlying wiki page → ack
+    invalidates → next run sees the finding again."""
+    ws = tmp_path / "ws"
+    _build_quote_density_only_fixture(ws)
+    out1 = tmp_path / "out1"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out1),
+        "--accept-on", "quote_density",
+        "--remember-acks",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    # Edit the file → sha256 changes → ack invalidated.
+    page = ws / "wiki" / "concepts" / "c.md"
+    page.write_text(page.read_text() + "\n\n## extra heading\n")
+
+    out2 = tmp_path / "out2"
+    res2 = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out2),
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    # No --accept-on, no --remember-acks; finding now live but not
+    # interactive (no TTY) → should refuse via "needs decision" path.
+    assert res2.returncode != 0
+    assert "need decision" in (res2.stderr + res2.stdout)
+
+
+def test_acks_never_contain_samples_on_disk(
+        env_with_ce, tmp_path: Path):
+    """Build a fixture with PII; ack it; assert the persisted ack file
+    contains zero @ characters anywhere."""
+    ws = tmp_path / "ws-pii"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        "Author email: alice@somecompany.com. SSN 987-65-4321.\n"
+    )
+    out = tmp_path / "out"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--accept-on", "all",
+        "--remember-acks",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    ack_file = ws / ".curator" / "preflight-acks.json"
+    assert ack_file.is_file()
+    text = ack_file.read_text()
+    assert "@" not in text
+    assert "987-65-4321" not in text
+
+
+def test_list_acks_command(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws"
+    _build_quote_density_only_fixture(ws)
+    # First, populate acks.
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(tmp_path / "out"),
+        "--accept-on", "all",
+        "--remember-acks",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    # Now list.
+    res = run_script(
+        "subgraph_export.py",
+        "--list-acks",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert "ack(s)" in res.stdout
+    assert "ack_id" in res.stdout
+
+
+def test_list_acks_empty(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "subgraph_export.py",
+        "--list-acks",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert "no acks" in res.stdout
+
+
+def test_clear_acks_with_auto_yes(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws"
+    _build_quote_density_only_fixture(ws)
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(tmp_path / "out"),
+        "--accept-on", "all",
+        "--remember-acks",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    ack_file = ws / ".curator" / "preflight-acks.json"
+    assert ack_file.is_file()
+    res = run_script(
+        "subgraph_export.py",
+        "--clear-acks",
+        "--accept-on", "all",  # auto-confirm via accept-on=all
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert "cleared" in res.stdout
+    assert not ack_file.exists()
+
+
+# --- per-detector gating flags (v0.4.0) ----------------------------------
+
+
+def _build_quote_density_only_fixture(ws: Path) -> None:
+    """Wiki where the only finding is quote_density (no PII, no GPL).
+    Lets us test per-kind gating without other findings interfering."""
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n\n"
+        "(vault:src.extracted.md)\n\n"
+        + "> heavy block quote line for fair use review\n" * 30
+    )
+    (ws / "vault" / "src.extracted.md").write_text(
+        "---\ntitle: Source\nsource_url: https://arxiv.org/abs/x\n---\n"
+        "Body.\n"
+    )
+
+
+def test_refuse_on_specific_kind_blocks(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(tmp_path / "out"),
+        "--refuse-on", "quote_density",
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "refused by policy" in (res.stderr + res.stdout)
+
+
+def test_accept_on_specific_kind_proceeds(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-accept"
+    _build_quote_density_only_fixture(ws)
+    out = tmp_path / "out-accept"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--accept-on", "quote_density",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    # Proceeded successfully; auto-acceptance reported in stderr.
+    assert (out / "_export-manifest.json").is_file()
+    assert "auto-accepted by policy" in res.stderr
+
+
+def test_refuse_on_other_kind_does_not_block(env_with_ce, tmp_path: Path):
+    """quote_density finding present, but --refuse-on=gpl_contagion
+    only blocks on gpl. Falls through to non-interactive refuse path
+    because the finding is unhandled (PROMPT in non-tty)."""
+    ws = tmp_path / "ws-other"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(tmp_path / "out"),
+        "--refuse-on", "gpl_contagion",
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    # quote_density falls through to PROMPT, which without TTY refuses.
+    assert res.returncode != 0
+    assert "need decision" in (res.stderr + res.stdout)
+
+
+def test_carve_out_refuse_all_accept_one(env_with_ce, tmp_path: Path):
+    """--refuse-on=all --accept-on=quote_density → quote_density
+    auto-accepted, others would refuse. Our fixture only has
+    quote_density, so the export should proceed."""
+    ws = tmp_path / "ws-carve"
+    _build_quote_density_only_fixture(ws)
+    out = tmp_path / "out-carve"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--refuse-on", "all",
+        "--accept-on", "quote_density",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert (out / "_export-manifest.json").is_file()
+
+
+def test_strict_alias_still_works_with_deprecation(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-strict-alias"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(tmp_path / "out"),
+        "--strict",  # deprecated, should still refuse
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "deprecated" in res.stderr
+    assert "refused by policy" in (res.stderr + res.stdout)
+
+
+def test_yes_alias_still_works_with_deprecation(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-yes-alias"
+    _build_quote_density_only_fixture(ws)
+    out = tmp_path / "out-yes-alias"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--yes",  # deprecated, should still auto-accept
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    assert (out / "_export-manifest.json").is_file()
+    assert "deprecated" in res.stderr
+
+
+def test_strict_and_refuse_on_together_errors(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-conflict"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(tmp_path / "out"),
+        "--strict", "--refuse-on", "gpl_contagion",
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "mutually exclusive" in (res.stderr + res.stdout)
+
+
+def test_unknown_kind_errors_at_parse_time(env_with_ce, tmp_path: Path):
+    ws = tmp_path / "ws-typo"
+    _build_quote_density_only_fixture(ws)
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(tmp_path / "out"),
+        "--refuse-on", "quotedensity",  # typo: should be quote_density
+        "--workspace", str(ws),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    combined = (res.stderr + res.stdout).lower()
+    assert "unknown kind" in combined
+
+
 # --- info-only findings don't gate export (v0.2.1.1) ---------------------
 
 
@@ -639,7 +1082,8 @@ def test_dense_pii_export_still_refuses_in_noninteractive(
         env=env_with_ce, check=False,
     )
     assert res.returncode != 0
-    assert "warn/block findings" in (res.stderr + res.stdout)
+    combined = res.stderr + res.stdout
+    assert "warn/block" in combined or "not interactive" in combined
 
 
 # --- manifest must never leak PII (v0.2.1 regression test) ---------------
