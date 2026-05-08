@@ -65,6 +65,19 @@ import preflight  # type: ignore
 
 
 MANIFEST_SCHEMA_VERSION = 1
+# Versions of the *incoming* `_export-manifest.json` we know how to read.
+# When a publisher emits a manifest with `schema_version` outside this
+# set, the merge proceeds best-effort (Python dict.get fallbacks make
+# unknown fields harmless), but the user is warned in stderr and the
+# audit report so version skew is visible. Update when subgraph-export's
+# manifest schema changes.
+INCOMING_MANIFEST_KNOWN_VERSIONS = {1, 2}
+# Fields we expect on every well-formed incoming manifest. Missing fields
+# don't fail the merge but produce a "manifest compatibility" warning so
+# truncated/corrupt manifests don't fail downstream in confusing ways.
+INCOMING_MANIFEST_REQUIRED_FIELDS = (
+    "schema_version", "exported_at", "scope_pages",
+)
 
 
 # --- argparse plumbing ----------------------------------------------------
@@ -565,6 +578,21 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
                 L.append(f"  why ({k}): {f.get('rationale','')}")
             L.append("")
 
+    warnings = manifest.get("incoming_manifest_warnings", [])
+    if warnings:
+        L.append("## Incoming manifest compatibility")
+        L.append("")
+        L.append(
+            "Notes about the source's `_export-manifest.json` "
+            "(version skew, missing fields, etc). The merge proceeded "
+            "best-effort regardless. If something looks off downstream, "
+            "these are the place to look."
+        )
+        L.append("")
+        for w in warnings:
+            L.append(f"- {w}")
+        L.append("")
+
     L.append("## Manifest counts")
     L.append("")
     L.append(f"- wiki pages imported: {len(manifest['wiki_pages'])}")
@@ -610,16 +638,67 @@ def cmd_stage(args) -> int:
     # subgraph-export (sharing-safe default). We use it to mark
     # vault_missing source stubs with full provenance so the receiving
     # user (or hydrate-vault) knows where to re-acquire each source.
+    #
+    # Schema-version validation (v0.4.1): warn (don't refuse) when the
+    # incoming manifest's `schema_version` is outside what we know how
+    # to read, or when expected fields are missing. The merge proceeds
+    # best-effort either way — Python dict.get fallbacks make unknown
+    # fields harmless and missing fields turn into empty defaults — but
+    # the user gets visibility through stderr and the audit report.
     incoming_vault_meta: dict[str, dict] = {}
+    incoming_manifest_warnings: list[str] = []
     src_manifest_path = source / "_export-manifest.json"
     if src_manifest_path.is_file():
         try:
             sm = json.loads(src_manifest_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            sm = None
+            incoming_manifest_warnings.append(
+                f"manifest at {src_manifest_path} is unreadable ({e}); "
+                "merge will proceed without manifest-driven vault "
+                "metadata."
+            )
+        if isinstance(sm, dict):
+            sv = sm.get("schema_version")
+            if sv is None:
+                incoming_manifest_warnings.append(
+                    "incoming manifest has no `schema_version` field; "
+                    "treating as 1 (oldest known)."
+                )
+                sv = 1
+            elif not isinstance(sv, int):
+                incoming_manifest_warnings.append(
+                    f"incoming manifest schema_version={sv!r} is not "
+                    "an integer; ignoring version checks."
+                )
+            elif sv not in INCOMING_MANIFEST_KNOWN_VERSIONS:
+                incoming_manifest_warnings.append(
+                    f"incoming manifest schema_version={sv} is outside "
+                    "the supported range "
+                    f"{sorted(INCOMING_MANIFEST_KNOWN_VERSIONS)}. "
+                    "Best-effort merge; some fields may be ignored."
+                )
+            missing = [k for k in INCOMING_MANIFEST_REQUIRED_FIELDS
+                       if k not in sm]
+            if missing:
+                incoming_manifest_warnings.append(
+                    f"incoming manifest is missing expected fields: "
+                    f"{missing}. Best-effort merge."
+                )
             for entry in sm.get("vault_metadata", []):
-                if entry.get("rel"):
+                if isinstance(entry, dict) and entry.get("rel"):
                     incoming_vault_meta[entry["rel"]] = entry
-        except (json.JSONDecodeError, OSError):
-            pass
+    else:
+        incoming_manifest_warnings.append(
+            f"no _export-manifest.json at {source}. Merge will work "
+            "for plain wiki layouts without provenance metadata, but "
+            "vault_missing tagging will be limited."
+        )
+
+    # Surface warnings on stderr immediately so the user sees them
+    # before the (potentially long) merge work runs.
+    for w in incoming_manifest_warnings:
+        sys.stderr.write(f"merge: manifest compatibility — {w}\n")
 
     # 1. Vault reconciliation.
     receiver_index = reconcile.index_vault(workspace / "vault")
@@ -823,6 +902,7 @@ def cmd_stage(args) -> int:
         "missing_vault": missing_vault_marks,
         "preflight_summary": preflight.manifest_summary(preflight_findings),
         "preflight_findings": preflight_findings_safe,
+        "incoming_manifest_warnings": incoming_manifest_warnings,
     }
     staging["apply_json"].write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"

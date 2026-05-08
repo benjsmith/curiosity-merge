@@ -183,10 +183,23 @@ def _one_hop_neighbors(page: Path, all_pages: list[Path], wiki_dir: Path) -> lis
 # curiosity-engine workflows) may exceed both. Users with a specific
 # use case that complies can opt in via --allow-license-class.
 _REDISTRIBUTABLE_LICENSES = {
+    # Public-domain-equivalent
     "cc0", "public-domain", "publicdomain",
+    "unlicense",            # equivalent intent to CC0; common on small repos
+    "0bsd", "bsd-0",        # zero-clause BSD; effectively public domain
+    # Creative Commons attribution / share-alike (modern + older versions)
     "cc-by", "cc-by-sa",
-    "cc-by-3.0", "cc-by-4.0", "cc-by-sa-3.0", "cc-by-sa-4.0",
+    "cc-by-1.0", "cc-by-2.0", "cc-by-2.5",
+    "cc-by-3.0", "cc-by-4.0",
+    "cc-by-sa-1.0", "cc-by-sa-2.0", "cc-by-sa-2.5",
+    "cc-by-sa-3.0", "cc-by-sa-4.0",
+    # GNU Free Documentation License — Wikipedia content (older articles
+    # are dual-licensed CC-BY-SA / GFDL; some derivatives are tagged GFDL only)
+    "gfdl", "gfdl-1.2", "gfdl-1.3",
+    # Permissive software licenses
     "mit", "apache-2.0", "apache2", "bsd", "bsd-3-clause", "bsd-2-clause",
+    # File-level copyleft (acceptable for redistribution; no whole-wiki
+    # contagion risk because the obligation stays with the file)
     "mpl-2.0",
     "arxiv-non-exclusive",  # arXiv's default license permits redistribution;
                             # see docs/licensing.md for the third-party caveat

@@ -347,9 +347,19 @@ _RESTRICTIVE_LICENSE_TOKENS = {
 # specific use case that complies can opt back in via
 # subgraph_export.py --allow-license-class.
 _OPEN_LICENSE_TOKENS = {
+    # Mirrors subgraph_export._REDISTRIBUTABLE_LICENSES — kept in sync
+    # because the license-consistency check uses this set to decide
+    # "the license tag claims open access" before flagging on a paywalled
+    # URL. If the two diverge intentionally one day, document why.
     "cc0", "public-domain", "publicdomain",
+    "unlicense",
+    "0bsd", "bsd-0",
     "cc-by", "cc-by-sa",
-    "cc-by-3.0", "cc-by-4.0", "cc-by-sa-3.0", "cc-by-sa-4.0",
+    "cc-by-1.0", "cc-by-2.0", "cc-by-2.5",
+    "cc-by-3.0", "cc-by-4.0",
+    "cc-by-sa-1.0", "cc-by-sa-2.0", "cc-by-sa-2.5",
+    "cc-by-sa-3.0", "cc-by-sa-4.0",
+    "gfdl", "gfdl-1.2", "gfdl-1.3",
     "mit", "apache-2.0", "apache2", "bsd", "bsd-3-clause", "bsd-2-clause",
     "mpl-2.0",
     "arxiv-non-exclusive",

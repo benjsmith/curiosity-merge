@@ -716,6 +716,36 @@ def test_open_license_tokens_excludes_nc_nd():
     assert "cc-by-sa" in preflight._OPEN_LICENSE_TOKENS
 
 
+def test_open_license_tokens_includes_v041_additions():
+    """v0.4.1: GFDL (Wikipedia), Unlicense, 0BSD, older CC versions."""
+    expected = {
+        "gfdl", "gfdl-1.2", "gfdl-1.3",
+        "unlicense",
+        "0bsd", "bsd-0",
+        "cc-by-1.0", "cc-by-2.0", "cc-by-2.5",
+        "cc-by-sa-1.0", "cc-by-sa-2.0", "cc-by-sa-2.5",
+    }
+    missing = expected - preflight._OPEN_LICENSE_TOKENS
+    assert not missing, f"expected open license tokens missing: {missing}"
+
+
+def test_gfdl_does_not_trip_gpl_contagion(tmp_path: Path):
+    """GFDL is a documentation copyleft, not a software license, and we
+    deliberately treat it as redistributable. The GPL detector should
+    not mistakenly flag a `license: gfdl` frontmatter as contagion."""
+    f = _w(tmp_path / "wikipedia.md",
+           "---\ntitle: x\nlicense: gfdl-1.3\n---\n"
+           "Wikipedia-derived content.\n")
+    findings = preflight.find_gpl_contagion([f])
+    assert findings == []
+
+
+def test_unlicense_does_not_trip_gpl_contagion(tmp_path: Path):
+    f = _w(tmp_path / "u.md",
+           "---\ntitle: x\nlicense: unlicense\n---\nbody\n")
+    assert preflight.find_gpl_contagion([f]) == []
+
+
 # --- run_all + format_findings -------------------------------------------
 
 

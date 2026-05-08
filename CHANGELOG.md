@@ -1,5 +1,61 @@
 # Changelog
 
+## v0.4.1 — 2026-05-08
+
+Two small but real-user-relevant fixes from the v0.4.0 backlog.
+
+### Manifest schema-version validation (receiver-side)
+
+- `merge.py` now validates the incoming `_export-manifest.json`'s
+  `schema_version` against `INCOMING_MANIFEST_KNOWN_VERSIONS = {1, 2}`.
+  Unknown versions, missing `schema_version` field, missing required
+  fields, corrupt JSON, or no manifest at all → all produce a
+  warning on stderr and an entry under "Incoming manifest
+  compatibility" in the audit report.
+- **Best-effort, never refuses.** Python dict.get fallbacks already
+  make the merge tolerant of unknown fields and missing fields; the
+  validation just makes the situation visible to the user instead of
+  silently muddling through.
+- Required-field set: `schema_version`, `exported_at`, `scope_pages`.
+  Missing any of these is a useful signal that something's wrong with
+  the source export.
+
+### License allowlist expansion
+
+Added the genuinely-permissive licenses we'd left out:
+
+- **GFDL** (`gfdl`, `gfdl-1.2`, `gfdl-1.3`) — Wikipedia content. Older
+  Wikipedia articles are dual-licensed CC-BY-SA / GFDL; some
+  derivatives are tagged GFDL only. Without this, every Wikipedia-
+  derived vault file would silently fail `--include-vault=owned`.
+- **Unlicense** (`unlicense`) — public-domain-equivalent declaration
+  common on small open-source repos. Conceptually identical to CC0.
+- **Zero-clause BSD** (`0bsd`, `bsd-0`) — public-domain-equivalent for
+  code; same conceptual category as CC0/Unlicense.
+- **Older CC versions** (`cc-by-1.0`, `-2.0`, `-2.5` and `cc-by-sa-1.0`,
+  `-2.0`, `-2.5`) — for older content. We had only 3.0 and 4.0; older
+  archives use earlier numbering.
+
+GPL-family tokens deliberately remain excluded from the redistributable
+allowlist to avoid contradictions with the GPL contagion detector;
+users who genuinely want to ship GPL'd content can use
+`redistributable: true` per file.
+
+### Tests
+
+- 138 active tests passing (was 129). 9 new across:
+  - Manifest version validation (5): unknown version, missing fields,
+    no manifest at all, corrupt manifest, known version no warning.
+  - License allowlist (4): v0.4.1 tokens present, GFDL doesn't trip
+    GPL detector, Unlicense doesn't trip GPL detector, GFDL/Unlicense/
+    older-CC ride along under `--include-vault=owned`.
+
+### Documentation
+
+- `docs/licensing.md` now has a structured table of recognized open
+  license tokens. Notes on what's deliberately NOT in the default
+  allowlist (NC/ND/GPL family).
+
 ## v0.4.0 — 2026-05-06
 
 Per-detector gating, persistent finding acks, license-symmetry, per-

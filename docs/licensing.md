@@ -31,10 +31,26 @@ This puts the sharing question on the right footing: **you're sharing your readi
 A vault file is treated as "redistributable" when its frontmatter has either:
 
 - `redistributable: true` — explicit declaration, set by the user
-- `license: <ID>` where `<ID>` matches one of the recognized open licenses: `CC0`, `CC-BY`, `CC-BY-SA`, `CC-BY-NC`, `CC-BY-ND`, `MIT`, `Apache-2.0`, `BSD-*`, `arxiv-non-exclusive`, `public-domain`
+- `license: <ID>` where `<ID>` matches one of the recognized open licenses (see table below)
 - `source_url` on a known preprint domain (`arxiv.org`, `biorxiv.org`, `chemrxiv.org`, `medrxiv.org`)
 
 Anything else is treated as not-known-redistributable and excluded under `--include-vault=owned`. Conservative by design: defaults that aren't safe must fail closed.
+
+**Recognized open license tokens** (case-insensitive matching against the value of `license:` frontmatter):
+
+| Family | Tokens |
+|---|---|
+| Public-domain-equivalent | `cc0`, `public-domain`, `publicdomain`, `unlicense`, `0bsd`, `bsd-0` |
+| Creative Commons attribution | `cc-by`, `cc-by-1.0`, `cc-by-2.0`, `cc-by-2.5`, `cc-by-3.0`, `cc-by-4.0` |
+| Creative Commons share-alike | `cc-by-sa`, `cc-by-sa-1.0`, `cc-by-sa-2.0`, `cc-by-sa-2.5`, `cc-by-sa-3.0`, `cc-by-sa-4.0` |
+| GNU Free Documentation (Wikipedia) | `gfdl`, `gfdl-1.2`, `gfdl-1.3` |
+| Permissive software | `mit`, `apache-2.0`, `apache2`, `bsd`, `bsd-2-clause`, `bsd-3-clause` |
+| File-level copyleft (acceptable) | `mpl-2.0` |
+| Preprint server defaults | `arxiv-non-exclusive` |
+
+**Not in the default allowlist** (deliberately):
+- `cc-by-nc-*` and `cc-by-nd-*` — opt-in via `--allow-license-class nc,nd` (see v0.2.1 rationale below)
+- `gpl-*`, `agpl-*`, `lgpl-*` — these would create internal contradictions with the GPL contagion detector. If you genuinely want to ship GPL'd content, use `redistributable: true` per file with full awareness of the copyleft obligations.
 
 ## What the manifest records
 

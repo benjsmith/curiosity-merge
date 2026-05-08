@@ -966,6 +966,115 @@ def test_unknown_kind_errors_at_parse_time(env_with_ce, tmp_path: Path):
     assert "unknown kind" in combined
 
 
+# --- incoming manifest schema-version validation (v0.4.1) ----------------
+
+
+def _build_minimal_export_for_merge(src: Path) -> None:
+    (src / "wiki" / "concepts").mkdir(parents=True)
+    (src / "wiki" / "projects").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (src / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\nclean prose.\n"
+    )
+
+
+def test_merge_warns_on_unknown_schema_version(
+        wiki_a: Path, env_with_ce, tmp_path: Path):
+    src = tmp_path / "future-source"
+    _build_minimal_export_for_merge(src)
+    (src / "_export-manifest.json").write_text(json.dumps({
+        "schema_version": 99,  # far in the future
+        "exported_at": "2099-01-01T00:00:00Z",
+        "scope_pages": ["concepts/c.md"],
+        "vault_metadata": [],
+    }))
+    res = run_script(
+        "merge.py", str(src), "--as-origin", "future",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "manifest compatibility" in res.stderr
+    assert "schema_version=99" in res.stderr
+    # Merge should still succeed — best-effort.
+    staging = wiki_a / ".curator" / ".merge-staging" / "future"
+    assert (staging / "audit-report.md").is_file()
+    audit = (staging / "audit-report.md").read_text()
+    assert "Incoming manifest compatibility" in audit
+    assert "schema_version=99" in audit
+
+
+def test_merge_warns_on_missing_required_fields(
+        wiki_a: Path, env_with_ce, tmp_path: Path):
+    src = tmp_path / "missing-fields"
+    _build_minimal_export_for_merge(src)
+    # Manifest with only schema_version — missing exported_at + scope_pages.
+    (src / "_export-manifest.json").write_text(json.dumps({
+        "schema_version": 2,
+    }))
+    res = run_script(
+        "merge.py", str(src), "--as-origin", "missing",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "manifest compatibility" in res.stderr
+    assert "missing expected fields" in res.stderr
+    assert (wiki_a / ".curator" / ".merge-staging" / "missing"
+            / "audit-report.md").is_file()
+
+
+def test_merge_warns_on_missing_manifest(
+        wiki_a: Path, env_with_ce, tmp_path: Path):
+    src = tmp_path / "no-manifest"
+    _build_minimal_export_for_merge(src)
+    # No _export-manifest.json at all.
+    res = run_script(
+        "merge.py", str(src), "--as-origin", "manual",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "no _export-manifest.json" in res.stderr
+    assert (wiki_a / ".curator" / ".merge-staging" / "manual"
+            / "audit-report.md").is_file()
+
+
+def test_merge_warns_on_corrupt_manifest(
+        wiki_a: Path, env_with_ce, tmp_path: Path):
+    src = tmp_path / "corrupt-manifest"
+    _build_minimal_export_for_merge(src)
+    (src / "_export-manifest.json").write_text("not valid json {{{")
+    res = run_script(
+        "merge.py", str(src), "--as-origin", "broken",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "unreadable" in res.stderr
+    # Merge still proceeds.
+    assert (wiki_a / ".curator" / ".merge-staging" / "broken"
+            / "audit-report.md").is_file()
+
+
+def test_merge_known_schema_version_no_compatibility_warning(
+        wiki_a: Path, env_with_ce, tmp_path: Path):
+    src = tmp_path / "good-manifest"
+    _build_minimal_export_for_merge(src)
+    (src / "_export-manifest.json").write_text(json.dumps({
+        "schema_version": 2,
+        "exported_at": "2026-05-07T00:00:00Z",
+        "scope_pages": ["concepts/c.md"],
+        "vault_metadata": [],
+    }))
+    res = run_script(
+        "merge.py", str(src), "--as-origin", "good",
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    # No "manifest compatibility" warnings on stderr.
+    assert "manifest compatibility" not in res.stderr
+
+
 # --- info-only findings don't gate export (v0.2.1.1) ---------------------
 
 
@@ -1410,6 +1519,46 @@ def test_merge_stage_preflight_does_not_block_apply(
 
 
 # --- license allowlist (v0.2.1 tightening) --------------------------------
+
+
+def test_export_owned_includes_gfdl_and_unlicense(
+        env_with_ce, tmp_path: Path):
+    """v0.4.1: GFDL (Wikipedia content) and Unlicense (public-domain-
+    equivalent code) ride along under --include-vault=owned."""
+    ws = tmp_path / "ws-v041"
+    (ws / "wiki" / "concepts").mkdir(parents=True)
+    (ws / "wiki" / "projects").mkdir(parents=True)
+    (ws / "vault").mkdir(parents=True)
+    (ws / ".curator").mkdir(parents=True)
+    (ws / "wiki" / "projects" / "p.md").write_text(
+        "---\ntitle: P\ntype: project\n---\n"
+    )
+    (ws / "wiki" / "concepts" / "c.md").write_text(
+        "---\ntitle: C\ntype: concept\nprojects: [p]\n---\n"
+        "(vault:wikipedia.md) (vault:tool.md) (vault:old.md)\n"
+    )
+    (ws / "vault" / "wikipedia.md").write_text(
+        "---\ntitle: Wiki\nlicense: gfdl-1.3\n"
+        "source_url: https://en.wikipedia.org/wiki/X\n---\nbody\n"
+    )
+    (ws / "vault" / "tool.md").write_text(
+        "---\ntitle: Tool\nlicense: unlicense\n"
+        "source_url: https://github.com/x/y\n---\nbody\n"
+    )
+    (ws / "vault" / "old.md").write_text(
+        "---\ntitle: Old\nlicense: cc-by-2.5\n"
+        "source_url: https://somewhere.invalid/\n---\nbody\n"
+    )
+    out = tmp_path / "exp"
+    run_script(
+        "subgraph_export.py",
+        "--project", "p", "--to", str(out),
+        "--include-vault", "owned",
+        "--workspace", str(ws),
+        env=env_with_ce,
+    )
+    bundled = sorted(p.name for p in (out / "vault").iterdir())
+    assert bundled == ["old.md", "tool.md", "wikipedia.md"]
 
 
 def test_export_owned_excludes_cc_by_nc_by_default(
