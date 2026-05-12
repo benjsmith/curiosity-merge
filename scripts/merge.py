@@ -124,6 +124,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="comma-separated Presidio entity types")
     ap.add_argument("--presidio-confidence", type=float, default=0.6,
                     help="Presidio score threshold (default 0.6)")
+    ap.add_argument("--presidio-language", default="en",
+                    help="comma-separated language codes (default: en)")
     ap.add_argument("--no-preflight-cache", action="store_true",
                     help="bypass per-file Presidio result cache")
     return ap
@@ -867,6 +869,10 @@ def cmd_stage(args) -> int:
               if e.strip())
         if args.presidio_entities else None
     )
+    presidio_languages = tuple(
+        lang.strip() for lang in args.presidio_language.split(",")
+        if lang.strip()
+    ) or ("en",)
     cache_dir = (None if args.no_preflight_cache
                  else workspace / ".curator" / ".preflight-cache")
     preflight_findings = preflight.run_all(
@@ -876,6 +882,7 @@ def cmd_stage(args) -> int:
         enable_presidio=args.enable_presidio,
         presidio_entities=presidio_entities,
         presidio_confidence=args.presidio_confidence,
+        presidio_languages=presidio_languages,
         cache_dir=cache_dir,
     )
     preflight_findings_safe = [preflight.manifest_safe(f)

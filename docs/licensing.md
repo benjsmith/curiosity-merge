@@ -217,7 +217,39 @@ This is essential: every academic paper has author PERSON entities. Without dens
 
 **Score threshold.** Default 0.6. Tune via `--presidio-confidence`.
 
-**Limitations of Presidio.** English-only by default (the included `en_core_web_lg` model). Non-English content gets poor NER. Doesn't catch *combined-data* inference ("Dr. Alice Johnson, age 42, treats patients at MGH" — each fragment benign; combined, identifies a specific healthcare worker). Doesn't disambiguate quoted vs published context. NER models update over time; your finding counts may shift between Presidio releases.
+### Combined-data inference (v0.5.0)
+
+Beyond individual entities, Presidio findings feed a `gdpr_combined_inference` post-processor that detects co-occurring entity *combinations* identifying a specific individual:
+
+| Combination | Window | Example |
+|---|---|---|
+| `PERSON_LOCATION_DATE` | 60 chars | "Dr. Alice Johnson, born 1985, in Boston" |
+| `PERSON_ORG` | 60 chars | "Bob Smith works at Google" |
+| `PERSON_AGE` | 40 chars | "Carol Davis, 51" |
+
+Windows are *empirically tuned* against a labeled corpus (`tuning/inference_corpus.py`). Re-run `tuning/tune_inference_windows.py` to verify or recalibrate.
+
+`gdpr_combined_inference` is a separate finding kind from `gdpr_likely_pii` — users can gate on it independently via `--refuse-on=gdpr_combined_inference` or accept-on. Severity follows the same density rule (sparse-in-fetched = info; dense or user-typed = warn).
+
+PERSON_MEDICAL is out of scope for v0.5.0: Presidio's `MEDICAL_LICENSE` recognizer matches only the US DEA Certificate Number format. General medical license patterns (NPI, RN-*, state MD-*) need custom recognizers; planned for a future release.
+
+### Multi-language support (v0.5.0, opt-in per language)
+
+`--presidio-language=CSV` selects which languages to analyze. Default `en`. Each additional language requires its corresponding spaCy model installed locally:
+
+```bash
+uv run python -m spacy download fr_core_news_lg   # French
+uv run python -m spacy download de_core_news_lg   # German
+uv run python -m spacy download es_core_news_lg   # Spanish
+# (full list: https://spacy.io/usage/models)
+
+uv run python3 <skill_path>/scripts/subgraph_export.py \
+    ... --enable-presidio --presidio-language en,fr
+```
+
+We **don't auto-install** because each model is ~500MB and the network call should be a deliberate choice, not a surprise. `setup.sh`'s Presidio offer prints the per-language commands as a hint. When a requested language's model isn't installed, `is_available()` returns False with a clear install hint, and the CLI falls back to the regex GDPR detector with a stderr note — never silently degrades.
+
+**Limitations of Presidio still:** doesn't disambiguate quoted vs published context. NER models update over time; finding counts may shift between Presidio releases (clear the cache after upgrading).
 
 ### Payment-card detection scope
 

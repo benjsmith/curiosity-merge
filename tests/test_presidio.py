@@ -52,7 +52,8 @@ def test_analyze_files_returns_empty_when_engine_unavailable(
         monkeypatch, tmp_path: Path):
     """analyze_files() short-circuits with empty list when engine
     isn't initialized — never raises."""
-    monkeypatch.setattr(presidio_gate, "_get_engine", lambda: None)
+    monkeypatch.setattr(presidio_gate, "_get_engine",
+                         lambda languages=("en",): None)
     f = _w(tmp_path / "p.md", "Some text with alice@somecompany.com\n")
     out = presidio_gate.analyze_files([f])
     assert out == []
@@ -65,7 +66,8 @@ def test_run_all_falls_back_to_regex_when_presidio_unavailable(
     return findings."""
     monkeypatch.setattr(presidio_gate, "_PRESIDIO_AVAILABLE", False)
     monkeypatch.setattr(presidio_gate, "_IMPORT_ERROR", "simulated")
-    monkeypatch.setattr(presidio_gate, "_get_engine", lambda: None)
+    monkeypatch.setattr(presidio_gate, "_get_engine",
+                         lambda languages=("en",): None)
     f = _w(tmp_path / "leak.md",
            "---\nt: x\n---\nContact alice@somecompany.com.\n")
     findings = preflight.run_all(
@@ -93,9 +95,10 @@ def _fake_presidio_module(findings_by_subject: dict[str, dict]):
     API. Used to exercise preflight._run_presidio_with_cache without
     loading the real Presidio."""
     mod = MagicMock()
-    mod.cache_config_hash = lambda entities, conf: "testhash"
+    mod.DEFAULT_LANGUAGES = ("en",)
+    mod.cache_config_hash = lambda entities, conf, languages=None: "testhash"
 
-    def analyze(targets, *, entities, confidence):
+    def analyze(targets, *, entities, confidence, languages=None):
         out = []
         for p in targets:
             if str(p) in findings_by_subject:
@@ -184,8 +187,10 @@ def test_cache_invalidates_on_config_change(tmp_path: Path):
 
     # Two configs that should produce different hashes.
     mod = MagicMock()
+    mod.DEFAULT_LANGUAGES = ("en",)
     mod.cache_config_hash = (
-        lambda entities, conf: "h1" if "PERSON" in entities else "h2"
+        lambda entities, conf, languages=None:
+            "h1" if "PERSON" in entities else "h2"
     )
 
     call_count = {"n": 0}
@@ -251,6 +256,172 @@ pytestmark_real = pytest.mark.skipif(
     not _presidio_ready(),
     reason="presidio-analyzer + spaCy model not installed",
 )
+
+
+@pytestmark_real
+def test_real_presidio_combined_inference_person_location_date(
+        tmp_path: Path):
+    """v0.5.0: PERSON + LOCATION + DATE_TIME within 60 chars → fires
+    gdpr_combined_inference finding."""
+    f = _w(tmp_path / "id.md",
+           "Dr. Alice Johnson, born 1985, lives in Boston.")
+    findings = presidio_gate.analyze_files(
+        [f], entities=("PERSON", "LOCATION", "DATE_TIME"),
+        confidence=0.6,
+    )
+    inference = [f for f in findings if f["kind"] == "gdpr_combined_inference"]
+    assert inference
+    assert "PERSON_LOCATION_DATE" in inference[0]["summary"]
+
+
+@pytestmark_real
+def test_real_presidio_combined_inference_person_org(tmp_path: Path):
+    """PERSON + ORGANIZATION within 60 chars → fires PERSON_ORG."""
+    f = _w(tmp_path / "id.md",
+           "Dr. Alice Johnson works at Google.")
+    findings = presidio_gate.analyze_files(
+        [f], entities=("PERSON",), confidence=0.3,
+    )
+    inference = [f for f in findings if f["kind"] == "gdpr_combined_inference"]
+    assert inference
+    assert "PERSON_ORG" in inference[0]["summary"]
+
+
+@pytestmark_real
+def test_real_presidio_combined_inference_suppresses_person_age_subset(
+        tmp_path: Path):
+    """When PERSON_LOCATION_DATE fires, the enclosed PERSON_AGE
+    subset shouldn't double-count."""
+    f = _w(tmp_path / "id.md",
+           "Dr. Alice Johnson, age 42, lives in Boston.")
+    findings = presidio_gate.analyze_files(
+        [f], entities=("PERSON", "LOCATION", "DATE_TIME"),
+        confidence=0.6,
+    )
+    inference = [f for f in findings if f["kind"] == "gdpr_combined_inference"]
+    assert inference
+    summary = inference[0]["summary"]
+    # PERSON_LOCATION_DATE should fire; PERSON_AGE should be suppressed
+    # because its constituent PERSON+DATE_TIME is enclosed by the
+    # full triple.
+    assert "PERSON_LOCATION_DATE" in summary
+    assert "PERSON_AGE" not in summary
+
+
+@pytestmark_real
+def test_real_presidio_combined_inference_density_sparse_in_fetched(
+        tmp_path: Path):
+    """Inside FETCHED markers with a sparse hit count (1 inference
+    in ~50K chars) → info severity, not warn."""
+    body = (
+        "Dr. Alice Johnson, born 1985, lives in Boston.\n\n"
+        + "padding text " * 4500  # ~50K chars
+    )
+    text = (
+        "---\nt: x\n---\n\n"
+        "<!-- BEGIN FETCHED CONTENT -->\n"
+        + body
+        + "\n<!-- END FETCHED CONTENT -->\n"
+    )
+    f = _w(tmp_path / "paper.md", text)
+    findings = presidio_gate.analyze_files(
+        [f], entities=("PERSON", "LOCATION", "DATE_TIME"),
+        confidence=0.6,
+    )
+    inference = [f for f in findings if f["kind"] == "gdpr_combined_inference"]
+    assert inference
+    assert inference[0]["severity"] == "info"
+
+
+@pytestmark_real
+def test_real_presidio_combined_inference_density_dense_in_fetched(
+        tmp_path: Path):
+    """Inside FETCHED markers with many inference hits → warn (looks
+    like directory dump)."""
+    rows = "\n".join(
+        f"Dr. Person{i} Smith, born {1950 + i}, lives in City{i}."
+        for i in range(50)  # 50 inference hits in ~3000 chars
+    )
+    text = (
+        "---\nt: x\n---\n\n"
+        "<!-- BEGIN FETCHED CONTENT -->\n"
+        + rows
+        + "\n<!-- END FETCHED CONTENT -->\n"
+    )
+    f = _w(tmp_path / "dump.md", text)
+    findings = presidio_gate.analyze_files(
+        [f], entities=("PERSON", "LOCATION", "DATE_TIME"),
+        confidence=0.6,
+    )
+    inference = [f for f in findings if f["kind"] == "gdpr_combined_inference"]
+    assert inference
+    assert inference[0]["severity"] == "warn"
+
+
+@pytestmark_real
+def test_real_presidio_combined_inference_manifest_safe(tmp_path: Path):
+    """Inference findings must not leak person/location/date values
+    into manifest-safe projection."""
+    f = _w(tmp_path / "id.md",
+           "Dr. Alice Johnson, born 1985, lives in Boston.")
+    findings = presidio_gate.analyze_files(
+        [f], entities=("PERSON", "LOCATION", "DATE_TIME"),
+        confidence=0.6,
+    )
+    inference = [f for f in findings if f["kind"] == "gdpr_combined_inference"]
+    assert inference
+    safe = preflight.manifest_safe(inference[0])
+    assert "samples" not in safe
+    for val in ("Alice Johnson", "Boston", "1985"):
+        assert val not in safe["rationale"]
+        assert val not in safe["summary"]
+
+
+def test_language_model_map_has_common_langs():
+    """Defensive: the language model map should contain the common
+    languages users are likely to need. We hardcode the spaCy model
+    names so misconfiguration errors are loud."""
+    for lang in ("en", "fr", "de", "es", "it"):
+        assert lang in presidio_gate.LANGUAGE_MODEL_MAP
+
+
+def test_cache_config_hash_invalidates_on_language_change():
+    """Language list is part of the cache key — switching languages
+    forces re-analysis."""
+    h_en = presidio_gate.cache_config_hash(
+        ("PERSON",), 0.6, languages=("en",),
+    )
+    h_en_fr = presidio_gate.cache_config_hash(
+        ("PERSON",), 0.6, languages=("en", "fr"),
+    )
+    h_fr = presidio_gate.cache_config_hash(
+        ("PERSON",), 0.6, languages=("fr",),
+    )
+    assert h_en != h_en_fr
+    assert h_en != h_fr
+    assert h_en_fr != h_fr
+
+
+def test_cache_config_hash_language_order_insensitive():
+    """[en,fr] and [fr,en] must produce the same hash so the cache
+    doesn't get spuriously invalidated by CLI flag ordering."""
+    h_1 = presidio_gate.cache_config_hash(
+        ("PERSON",), 0.6, languages=("en", "fr"),
+    )
+    h_2 = presidio_gate.cache_config_hash(
+        ("PERSON",), 0.6, languages=("fr", "en"),
+    )
+    assert h_1 == h_2
+
+
+def test_unknown_language_fails_loudly_via_is_available():
+    """A language without a corresponding spaCy model returns
+    available=False with a hint, never silently degrades."""
+    available, reason = presidio_gate.is_available(
+        languages=("xx",)  # not a real language code
+    )
+    assert not available
+    assert reason and "spacy" in reason.lower()
 
 
 @pytestmark_real

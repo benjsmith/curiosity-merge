@@ -637,6 +637,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--presidio-confidence", type=float, default=0.6,
                     help="Presidio score threshold (default: 0.6 — same as "
                          "Presidio's own analyzer default)")
+    ap.add_argument("--presidio-language", default="en",
+                    help="comma-separated language codes for Presidio "
+                         "(default: en). Each language requires a "
+                         "corresponding spaCy model installed locally — "
+                         "we don't auto-install (network + ~500MB per "
+                         "model). To add e.g. French: "
+                         "`uv run python -m spacy download fr_core_news_lg` "
+                         "then `--presidio-language en,fr`.")
     ap.add_argument("--no-preflight-cache", action="store_true",
                     help="bypass the per-file Presidio result cache "
                          "(default: cache stored at "
@@ -795,6 +803,10 @@ def main(argv: list[str] | None = None) -> int:
                   if e.strip())
             if args.presidio_entities else None
         )
+        presidio_languages = tuple(
+            lang.strip() for lang in args.presidio_language.split(",")
+            if lang.strip()
+        ) or ("en",)
         cache_dir = (None if args.no_preflight_cache
                      else workspace / ".curator" / ".preflight-cache")
         findings = preflight.run_all(
@@ -805,6 +817,7 @@ def main(argv: list[str] | None = None) -> int:
             enable_presidio=args.enable_presidio,
             presidio_entities=presidio_entities,
             presidio_confidence=args.presidio_confidence,
+            presidio_languages=presidio_languages,
             cache_dir=cache_dir,
         )
 

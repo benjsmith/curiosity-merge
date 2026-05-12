@@ -871,6 +871,7 @@ KNOWN_FINDING_KINDS = (
     "license_inconsistent",
     "gpl_contagion",
     "gdpr_likely_pii",
+    "gdpr_combined_inference",  # v0.5.0: Presidio combined-data inference
 )
 
 
@@ -1128,6 +1129,7 @@ def run_all(*, scope_pages: list[Path], vault_files: list[Path],
             enable_presidio: bool = False,
             presidio_entities: tuple[str, ...] | list[str] | None = None,
             presidio_confidence: float = 0.6,
+            presidio_languages: tuple[str, ...] | list[str] | None = None,
             cache_dir: Path | None = None) -> list[dict]:
     """Convenience: run every detector and return a flat findings list.
 
@@ -1157,7 +1159,9 @@ def run_all(*, scope_pages: list[Path], vault_files: list[Path],
         # Local import to avoid import-time spaCy load when not needed.
         sys.path.insert(0, str(Path(__file__).parent))
         import presidio_gate  # type: ignore
-        available, reason = presidio_gate.is_available()
+        languages = tuple(presidio_languages) if presidio_languages else \
+            presidio_gate.DEFAULT_LANGUAGES
+        available, reason = presidio_gate.is_available(languages)
         if available:
             entities = (presidio_entities
                         if presidio_entities is not None
@@ -1166,6 +1170,7 @@ def run_all(*, scope_pages: list[Path], vault_files: list[Path],
                 presidio_gate, targets,
                 entities=tuple(entities),
                 confidence=presidio_confidence,
+                languages=languages,
                 cache_dir=cache_dir,
             ))
             presidio_used = True
@@ -1199,24 +1204,30 @@ def _file_sha256(path: Path) -> str:
 def _run_presidio_with_cache(presidio_gate_mod, targets: list[Path],
                               *, entities: tuple[str, ...],
                               confidence: float,
-                              cache_dir: Path | None) -> list[dict]:
+                              languages: tuple[str, ...] | None = None,
+                              cache_dir: Path | None = None) -> list[dict]:
     """Run Presidio per file with optional per-file result caching.
 
-    Cache key is (file sha256, entity-list+confidence hash). Cache value
-    is a manifest-safe finding (or sentinel for "no findings"). Samples
-    are NEVER cached — they're discarded after the local terminal sees
-    them, and the cache must not become a side-channel for them. On
-    cache hit, the per-file finding has empty `samples`.
+    Cache key is (file sha256, entity-list+confidence+languages hash).
+    Cache value is a manifest-safe finding (or sentinel for "no
+    findings"). Samples are NEVER cached — they're discarded after the
+    local terminal sees them, and the cache must not become a
+    side-channel for them. On cache hit, the per-file finding has empty
+    `samples`.
 
     If `cache_dir` is None, no caching; just analyze every file.
     """
+    langs = languages or presidio_gate_mod.DEFAULT_LANGUAGES
     if cache_dir is None:
         return presidio_gate_mod.analyze_files(
             targets, entities=entities, confidence=confidence,
+            languages=langs,
         )
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cfg_hash = presidio_gate_mod.cache_config_hash(entities, confidence)
+    cfg_hash = presidio_gate_mod.cache_config_hash(
+        entities, confidence, languages=langs,
+    )
 
     cached: list[dict] = []
     to_analyze: list[Path] = []
@@ -1232,12 +1243,16 @@ def _run_presidio_with_cache(presidio_gate_mod, targets: list[Path],
         if cache_path.is_file():
             try:
                 payload = json.loads(cache_path.read_text())
-                if payload.get("found"):
-                    # Hydrate as a finding with empty samples (cache
-                    # never stores samples; rationale + summary are
-                    # safe and stable).
-                    cached.append({**payload["finding"], "samples": []})
-                # else: cached miss, no finding to add
+                # Cache schema v2 (v0.5.0): a file can produce multiple
+                # findings (e.g. gdpr_likely_pii + gdpr_combined_inference).
+                # Backwards-compat: old payloads with `finding` (singular)
+                # are loaded as a one-element list.
+                fi = payload.get("findings")
+                if fi is None and payload.get("found"):
+                    fi = [payload["finding"]]
+                for f in fi or []:
+                    # Hydrate with empty samples (cache never stores them).
+                    cached.append({**f, "samples": []})
                 continue
             except (json.JSONDecodeError, OSError):
                 pass  # corrupt cache → re-analyze
@@ -1246,25 +1261,34 @@ def _run_presidio_with_cache(presidio_gate_mod, targets: list[Path],
     if to_analyze:
         fresh = presidio_gate_mod.analyze_files(
             to_analyze, entities=entities, confidence=confidence,
+            languages=langs,
         )
     else:
         fresh = []
-    fresh_by_subject = {f["subject"]: f for f in fresh}
+
+    # Group findings by file path (subject path; combined-inference
+    # findings carry the file path as their subject too).
+    fresh_by_subject: dict[str, list[dict]] = {}
+    for f in fresh:
+        subj = f["subject"]
+        # Strip the "— citation" suffix the quote-density detector uses;
+        # cache is keyed by file, not citation. Presidio findings don't
+        # use that pattern, so this is defensive only.
+        path_part = subj.split(" — ", 1)[0]
+        fresh_by_subject.setdefault(path_part, []).append(f)
 
     # Write cache entries for every analyzed file (hit and miss alike).
     for p in to_analyze:
         cache_path = cache_paths.get(p)
         if cache_path is None:
             continue
-        finding = fresh_by_subject.get(str(p))
-        if finding:
-            payload = {
-                "found": True,
-                "finding": {k: v for k, v in finding.items()
-                             if k != "samples"},
-            }
-        else:
-            payload = {"found": False}
+        findings_for_file = fresh_by_subject.get(str(p), [])
+        payload = {
+            "findings": [
+                {k: v for k, v in f.items() if k != "samples"}
+                for f in findings_for_file
+            ],
+        }
         try:
             cache_path.write_text(json.dumps(payload) + "\n")
         except OSError:
@@ -1396,6 +1420,9 @@ def _cli_main(argv: list[str] | None = None) -> int:
                     help="Presidio entity types (default: curated PII set)")
     ap.add_argument("--presidio-confidence", type=float, default=0.6,
                     help="Presidio score threshold (default 0.6)")
+    ap.add_argument("--presidio-language", default="en", metavar="CSV",
+                    help="comma-separated language codes (default: en). "
+                         "Each requires a spaCy model installed locally.")
     ap.add_argument("--show-acks", action="store_true",
                     help="print the workspace ack table and exit")
     ap.add_argument("--clear-acks", action="store_true",
@@ -1511,6 +1538,10 @@ def _cli_main(argv: list[str] | None = None) -> int:
               if e.strip())
         if args.presidio_entities else None
     )
+    presidio_languages = tuple(
+        lang.strip() for lang in args.presidio_language.split(",")
+        if lang.strip()
+    ) or ("en",)
     findings = run_all(
         scope_pages=pages, vault_files=vfs,
         include_non_native=args.include_non_native,
@@ -1518,6 +1549,7 @@ def _cli_main(argv: list[str] | None = None) -> int:
         enable_presidio=args.enable_presidio,
         presidio_entities=presidio_entities,
         presidio_confidence=args.presidio_confidence,
+        presidio_languages=presidio_languages,
         cache_dir=None,  # read-only audit; never write the export cache
     )
 

@@ -1,5 +1,105 @@
 # Changelog
 
+## v0.5.0 — 2026-05-12
+
+Two substantive Presidio enhancements from the v0.4.0 backlog.
+
+### Combined-data inference detector (`gdpr_combined_inference`)
+
+A new finding kind separate from `gdpr_likely_pii`. Detects entity
+*combinations* that, together, identify a specific individual even
+when no single entity alone would. Under GDPR Recital 26 (and similar
+regimes), combined-data PII is independently actionable.
+
+Three combination types:
+
+| Combination | Window | What it catches |
+|---|---|---|
+| `PERSON_LOCATION_DATE` | 60 chars | Full identification: "Dr. Alice Johnson, born 1985, in Boston" |
+| `PERSON_ORG` | 60 chars | Workplace ID: "Bob Smith works at Google" |
+| `PERSON_AGE` | 40 chars | Age-tied ID: "Carol Davis, 51" |
+
+**Windows are empirically tuned.** `tuning/inference_corpus.py` holds
+267 labeled samples (positive / negative) across the three combination
+types. `tuning/tune_inference_windows.py` sweeps a candidate range
+(20–300 chars), measures precision/recall/F1 at each, and picks the
+window maximizing F1. Re-run when changing the detector logic.
+
+Result table from the v0.5.0 calibration:
+- PERSON_LOCATION_DATE: window=60, F1=0.942, P=0.907, R=0.980
+- PERSON_ORG: window=60, F1=0.715, P=0.611, R=0.863 (ORG NER is
+  inherently noisier; surfaced as a signal, not gate)
+- PERSON_AGE: window=40, F1=0.878, P=0.915, R=0.843
+
+PERSON_LOCATION_DATE suppression rule: when a triple fires, the
+constituent PERSON+DATE pair is suppressed from PERSON_AGE to avoid
+double-counting the same identification.
+
+PERSON_MEDICAL deferred: Presidio's MEDICAL_LICENSE recognizer matches
+only the US DEA Certificate Number format. General medical license
+patterns (NPI, RN-*, state MD-*) need custom recognizers we'd write
+ourselves. Documented as a known limitation.
+
+Severity follows the existing density model:
+- Outside FETCHED markers → warn (user-typed content)
+- Inside markers, ≥ 0.1 inference hits per 1000 chars → warn (dump)
+- Inside markers, < 0.1 per 1000 chars → info (incidental)
+- Region < 2000 chars → info (too short to trust density math)
+
+Custom NLP config: Presidio's default mapping omits `ORG`, which
+would silently kill PERSON_ORG detection. v0.5.0 configures
+`NlpEngineProvider` with explicit `ORG → ORGANIZATION` mapping. ORG
+gets a 0.4 confidence multiplier (vs 0.85 for PERSON/LOC) to reflect
+that ORG NER is noisier.
+
+### Multi-language Presidio support (opt-in per language)
+
+- New `--presidio-language=CSV` flag on `subgraph_export.py`,
+  `merge.py`, and `preflight.py` standalone CLI. Default `en`.
+- Supported language codes mapped to recommended spaCy models:
+  `en`, `fr`, `de`, `es`, `it`, `pt`, `nl`, `zh`, `ja`, `ru`.
+- **Each language requires its corresponding spaCy model installed
+  locally.** We deliberately do NOT auto-install (network + ~500MB
+  per model — explicit consent matters). Unknown or uninstalled
+  language → `is_available()` returns False with a clear install hint,
+  and the CLI falls back to the regex GDPR detector with a stderr
+  note.
+- `setup.sh` now prints the per-language install commands after the
+  English Presidio install offer. Users install only what they need.
+- Multi-language analysis: when multiple languages are configured,
+  the analyzer runs once per language and dedups results by
+  `(start, end, entity_type)`. O(n_langs * region_len) cost; typically
+  cheap for 1–2 languages.
+- Cache key gains the language list (order-insensitive sort), so
+  switching `--presidio-language` invalidates the cache properly.
+
+### Manifest cache schema bump
+
+The per-file Presidio cache now stores multiple findings per file
+(`gdpr_likely_pii` + `gdpr_combined_inference` for the same file).
+Cache schema bumped to v2 with backwards-compat for v1 entries
+(`finding` singular hydrates as a one-element list). Samples still
+never persisted.
+
+### Tests
+
+- 152 active tests passing (was 138 at v0.4.1). 14 new for:
+  - Combined inference detection: PERSON+LOC+DATE, PERSON+ORG,
+    PERSON_AGE suppression rule, density-aware severity (sparse=info,
+    dense=warn).
+  - Manifest-safety: combined-inference samples don't leak into
+    manifest projection.
+  - Multi-language: language model map coverage, cache key
+    invalidates on language change, cache key order-insensitive,
+    unknown language fails gracefully via `is_available()`.
+
+### Documentation
+
+- `docs/licensing.md` — Presidio section expanded with combined-
+  inference table and multi-language install commands.
+- `tuning/` directory committed for transparency: corpus + tuning
+  script users can re-run to verify or recalibrate thresholds.
+
 ## v0.4.1 — 2026-05-08
 
 Two small but real-user-relevant fixes from the v0.4.0 backlog.
