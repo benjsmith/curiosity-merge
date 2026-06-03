@@ -22,6 +22,8 @@ This skill imports — never duplicates — these curiosity-engine modules:
 | `lint_scores` | scoring the merged wiki |
 | `vault_index` | re-indexing the merged vault for FTS5 + embeddings |
 
+The `entities` table in curiosity-engine's `.curator/identifiers.db` (the U1 IRI registry written by `identifier_cache.py`) is a **data** dependency, not a code one: `identity.py` reads it directly with stdlib `sqlite3` (read-only via `PRAGMA query_only=ON`) and replicates `write_entity`'s `same_as`-union semantics for the apply-time write, rather than importing `identifier_cache` — which keys its connection on the process cwd. The wire contract (table schema, IRI format, `same_as` bracket-list) is what's shared, and it is stable.
+
 ### Path resolution
 
 `setup.sh` exports `CURIOSITY_ENGINE_SCRIPTS_DIR` — the absolute path to curiosity-engine's `scripts/` directory in the same workspace. Each script in this skill begins with:
@@ -53,7 +55,8 @@ curiosity-merge/
 │   ├── subgraph_export.py
 │   ├── discover_bridges.py
 │   ├── merge.py
-│   ├── reconcile.py         # vault sha256 + page-stem collision helpers
+│   ├── reconcile.py         # vault sha256 + page-stem collision helpers (stem fallback)
+│   ├── identity.py          # IRI-keyed entity reconciliation (U1) + shard seam joins (U4)
 │   └── merge_evolve_guard.sh # hash-guard (named distinctly from curiosity-engine's evolve_guard.sh)
 └── template/
     └── prompts.md           # any worker prompt templates

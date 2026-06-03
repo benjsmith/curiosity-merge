@@ -39,7 +39,16 @@ uv run python3 <skill_path>/scripts/discover_bridges.py --limit 50
 git clone https://github.com/someone/their-wiki /tmp/their-wiki
 uv run python3 <skill_path>/scripts/merge.py /tmp/their-wiki --as-origin someone
 # review .curator/merge-<timestamp>.md, then approve the staged swap
+
+# Rejoin a U4 shard on its seam IRIs (identity-keyed, not slug-keyed)
+uv run python3 <skill_path>/scripts/merge.py \
+    --import-shard /tmp/shard-export.json /tmp/shard-wiki --as-origin shard1
 ```
+
+Merge reconciles entities by stable IRI (curiosity-engine U1) when pages
+carry one — same-IRI or overlapping-`same_as` pages collapse into one
+canonical page regardless of slug. Wikis with no minted IRIs merge by
+filename stem exactly as before.
 
 ## Publishing a sub-wiki
 
@@ -72,7 +81,8 @@ curiosity-merge/
 │   ├── merge.py
 │   ├── unmerge.py
 │   ├── hydrate_vault.py
-│   ├── reconcile.py
+│   ├── reconcile.py            # vault sha256 + page-stem collision (stem fallback)
+│   ├── identity.py            # IRI-keyed entity reconciliation (U1) + shard seam joins (U4)
 │   ├── preflight.py            # detectors (chain-merge, quote-density, license, GPL, regex PII)
 │   ├── presidio_gate.py        # optional Presidio NER+ML PII detector (v0.3.0)
 │   └── merge_evolve_guard.sh   # hash-guard (named distinctly from curiosity-engine's)

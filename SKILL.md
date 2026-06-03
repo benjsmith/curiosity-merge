@@ -1,6 +1,6 @@
 ---
 name: curiosity-merge
-description: "Sharing/federation layer for curiosity-engine wikis. Use when the user mentions 'merge wiki', 'combine wikis', 'share a sub-wiki', 'export project', 'subgraph export', 'discover bridges', 'cross-wiki', 'absorb someone else's wiki', or wants to publish/ingest a curiosity-wiki-tagged repo. Three verbs: merge, subgraph-export, discover-bridges. Requires curiosity-engine installed in the same workspace."
+description: "Sharing/federation layer for curiosity-engine wikis. Use when the user mentions 'merge wiki', 'combine wikis', 'share a sub-wiki', 'export project', 'subgraph export', 'discover bridges', 'cross-wiki', 'absorb someone else's wiki', 'federate', 'import a shard', 'reconcile by IRI/identity', or wants to publish/ingest a curiosity-wiki-tagged repo. Verbs: merge (slug- and IRI-keyed, plus --import-shard), subgraph-export, discover-bridges, unmerge, hydrate-vault. Requires curiosity-engine installed in the same workspace."
 ---
 
 # Curiosity Merge
@@ -83,14 +83,24 @@ Combines `<other-wiki-path>` into the current workspace's wiki. The pipeline:
 
 1. **Vault sha256 reconciliation** — identical content under different filenames is deduplicated; same filename, different content is renamed with an origin discriminator.
 2. **Source-stub stem reconciliation** — stubs pointing at the same vault file are collapsed; stubs are re-stemmed via curiosity-engine's `naming.citation_stem`.
-3. **Page-name collision queue** — pages with the same stem are NEVER silently overwritten. Identical content drops one; same topic / both substantive go to a manual-reconciliation queue with both versions preserved as `<stem>.md` and `<stem>-from-<origin>.md`; different topics that happen to share a stem are renamed with an origin discriminator.
-4. **Origin tagging** — every page from the other wiki gains an `origin: <name>` audit field in addition to its existing `projects:` set.
-5. **Untrusted framing** — every merged page body is wrapped in `<!-- BEGIN UNTRUSTED MERGED CONTENT — origin:<name> -->` framing and gets `untrusted: true` in frontmatter so future curator workers treat the content as data, not instructions.
-6. **Graph union** — the kuzu graph is rebuilt across the merged wiki via curiosity-engine's `graph.py rebuild wiki`.
-7. **Cross-origin bridge discovery** — `discover-bridges --across-origins` runs and writes its review queue.
-8. **Audit report** — `.curator/merge-<timestamp>.md` summarizes every reconciliation, every collision, and every bridge candidate. The user reviews this before any commit lands.
+3. **Identity reconciliation (IRI-keyed, U1)** — runs *before* stem collisions. Entity pages carrying a curiosity-engine `iri:` (or a `same_as:` map) are matched across the two wikis by shared `iri` first, then by any overlapping `authority:id` pair — read from the receiver's `.curator/identifiers.db` `entities` table and from page frontmatter. A matched entity collapses into the receiver's canonical page **regardless of slug**: it is not re-staged as a live page (its framed body is preserved under `collisions/` for review), wikilinks to its slug are redirected to the canonical slug, and its `same_as` map is unioned into the receiver's page frontmatter and `entities` registry on apply. Pages with no minted IRI fall through to the stem queue (step 4) exactly as before — identity reconciliation is purely additive, so a wiki with no IRIs merges byte-for-byte as it always did.
+4. **Page-name collision queue (stem fallback)** — pages with the same stem are NEVER silently overwritten. Identical content drops one; same topic / both substantive go to a manual-reconciliation queue with both versions preserved as `<stem>.md` and `<stem>-from-<origin>.md`; different topics that happen to share a stem are renamed with an origin discriminator.
+5. **Origin tagging** — every page from the other wiki gains an `origin: <name>` audit field in addition to its existing `projects:` set.
+6. **Untrusted framing** — every merged page body is wrapped in `<!-- BEGIN UNTRUSTED MERGED CONTENT — origin:<name> -->` framing and gets `untrusted: true` in frontmatter so future curator workers treat the content as data, not instructions.
+7. **Graph union** — the kuzu graph is rebuilt across the merged wiki via curiosity-engine's `graph.py rebuild wiki`.
+8. **Cross-origin bridge discovery** — `discover-bridges --across-origins` runs and writes its review queue.
+9. **Audit report** — `.curator/merge-<timestamp>.md` summarizes every reconciliation, every collision, and every bridge candidate. Identity reconciliations (which IRIs matched, which slugs collapsed, which were shard seam joins) are reported under a distinct `## Identity reconciliation` section, separate from the stem-based `## Page-name collisions`. The user reviews this before any commit lands.
 
 All work is staged in `.curator/.merge-staging/<origin>/` first. The atomic swap into `wiki/` and `vault/` only happens after the user reviews the audit report and explicitly approves. The receiving wiki's `.git` is untouched until the user runs their own `git -C wiki commit`.
+
+#### `merge --import-shard` — rejoin a U4 shard on its seam IRIs
+
+```
+uv run python3 <skill_path>/scripts/merge.py \
+    --import-shard <export.json> <shard-wiki-path> --as-origin <name>
+```
+
+Ingests a bounded sub-wiki **shard** — the output of curiosity-engine's `epoch_summary.py --shard <seed-page>` (the `export.json`) plus the shard's exported wiki tree (`<shard-wiki-path>`). The shard's `seam_entities[].iri` are the federation join keys: IRI-bearing entity pages inside the shard that are linked from outside it. Import runs the same identity reconciliation as a plain merge, with the seam IRIs flagged — so a seam entity the parent already holds reconciles into the parent's canonical page (no duplicate) rather than landing as a new page, and the audit's `## Identity reconciliation` section lists those seam joins distinctly. Apply and abandon use the normal `merge.py --apply <name>` / `--abandon <name>` verbs.
 
 ### `unmerge` — undo a previous merge
 
@@ -144,6 +154,7 @@ If alphaxiv isn't installed and an arXiv source needed PDF fallback, the script 
 - **Manipulated `(vault:...)` citations** pointing at non-existent or wrong-content vault files. **Defence**: every vault file referenced from merged pages must exist in the merged-vault index by sha256; citations to missing or sha-mismatched content get rewritten or flagged in the audit report.
 - **Path traversal in CLI args** (`--to ../../../etc/passwd`). **Defence**: paths containing `..` segments or absolute paths outside the workspace are rejected at argv-parse time.
 - **Page-name collisions on substantive pages** (both wikis have `concepts/transformer.md` with different content). **Defence**: NEVER silently overwrite. Always queue for human review with both versions preserved.
+- **Identity reconciliation respects the same posture** — when an incoming entity matches a receiver identity by `iri`/`same_as`, the receiver's page stays canonical and is never overwritten by untrusted incoming content; the incoming body is preserved under `collisions/` for review, and only the additive `same_as` union is written into the receiver. A spoofed incoming `iri` can at most attach extra `same_as` pairs to an entity the receiver already owns (visible in the audit) — it cannot replace the canonical page or its content.
 
 See `docs/trust-model.md` for the full threat list and decision rationale.
 

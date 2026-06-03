@@ -34,6 +34,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +63,7 @@ except ImportError as e:
 sys.path.insert(0, str(Path(__file__).parent))
 import reconcile  # type: ignore
 import preflight  # type: ignore
+import identity  # type: ignore
 
 
 MANIFEST_SCHEMA_VERSION = 1
@@ -100,6 +102,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="discard the staged merge under ORIGIN")
     ap.add_argument("--rerun-gates", metavar="ORIGIN", default=None,
                     help="re-run security/quality gates on existing staging")
+    ap.add_argument("--import-shard", metavar="EXPORT_JSON", default=None,
+                    help="stage a U4 shard export (epoch_summary.py --shard "
+                         "output) into this wiki, reconciling on its "
+                         "seam_entities[].iri. Requires <source> "
+                         "(the shard's exported wiki tree) and --as-origin.")
     ap.add_argument("--workspace", default=".",
                     help="receiving workspace root (default: cwd)")
 
@@ -235,6 +242,27 @@ def _rewrite_citations(body: str, alias_map: dict[str, str]) -> str:
         new = alias_map.get(target, target)
         return f"(vault:{new})"
     return CITATION_RE.sub(repl, body)
+
+
+def _redirect_wikilinks(body: str, slug_map: dict[str, str]) -> str:
+    """Rewrite `[[incoming-slug]]` → `[[canonical-slug]]` for entities that
+    reconciled to an existing receiver identity under a different slug.
+
+    Preserves any `|display` alias. A no-op when slug_map is empty (the
+    backward-compatible, no-IRI case), so non-identity merges are untouched.
+    """
+    if not slug_map:
+        return body
+
+    def repl(m):
+        inner = m.group(0)[2:-2]
+        target, sep, disp = inner.partition("|")
+        new = slug_map.get(target.strip())
+        if new is None:
+            return m.group(0)
+        return f"[[{new}{sep}{disp}]]" if sep else f"[[{new}]]"
+
+    return WIKILINK_RE.sub(repl, body)
 
 
 # --- gate runners (optional) ----------------------------------------------
@@ -504,6 +532,83 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
             L.append(f"  - incoming staged at: collisions/{c['stem']}-from-{origin}.md")
     L.append("")
 
+    recs = manifest.get("identity_reconciliations", [])
+    is_shard = manifest.get("is_shard_import", False)
+    if recs or is_shard:
+        L.append("## Identity reconciliation")
+        L.append("")
+        if is_shard:
+            L.append(
+                "Staged as a U4 shard import. Entities below reconciled on "
+                "their stable IRIs (the shard's seam join keys) rather than "
+                "on slug."
+            )
+        else:
+            L.append(
+                "Entity pages matched to existing receiver identities by "
+                "shared `iri` or overlapping `same_as` pair (U1). Each "
+                "collapsed into the receiver's canonical page regardless of "
+                "slug; wikilinks were redirected and `same_as` will be unioned "
+                "into the receiver on apply. This is distinct from the "
+                "stem-based handling above."
+            )
+        L.append("")
+        by_iri = [r for r in recs if r.get("match_kind") == "iri"]
+        by_sameas = [r for r in recs if r.get("match_kind") == "same_as"]
+        seams = [r for r in recs if r.get("is_seam")]
+        L.append(f"- matched by IRI: {len(by_iri)}")
+        L.append(f"- matched by same_as pair: {len(by_sameas)}")
+        slug_changes = [r for r in recs
+                        if r.get("incoming_slug") != r.get("canonical_slug")]
+        L.append(f"- slugs collapsed (different slug → canonical): "
+                 f"{len(slug_changes)}")
+        if is_shard:
+            L.append(f"- seam joins (parent already held the IRI): {len(seams)}")
+        L.append("")
+        if recs:
+            L.append("### IRIs matched")
+            L.append("")
+            for r in recs[:50]:
+                via = r.get("match_kind")
+                detail = (f" via `{', '.join(r.get('shared_pairs', []))}`"
+                          if via == "same_as" and r.get("shared_pairs") else "")
+                seam = " [seam]" if r.get("is_seam") else ""
+                L.append(
+                    f"- `{r.get('canonical_iri') or r.get('incoming_iri')}`"
+                    f"{seam} — incoming `{r.get('incoming_rel')}` → canonical "
+                    f"`{r.get('canonical_rel')}` (matched by {via}{detail})")
+            if len(recs) > 50:
+                L.append(f"- ... and {len(recs) - 50} more")
+            L.append("")
+        if slug_changes:
+            L.append("### Slugs collapsed")
+            L.append("")
+            for r in slug_changes[:50]:
+                L.append(
+                    f"- `{r.get('incoming_slug')}` → `{r.get('canonical_slug')}` "
+                    f"(wikilinks redirected; incoming body preserved for "
+                    f"review at collisions/{r.get('review_copy_rel')})")
+            L.append("")
+        if is_shard and seams:
+            L.append("### Seam joins")
+            L.append("")
+            L.append(
+                "Seam IRIs the parent already held — the shard rejoins here "
+                "rather than duplicating the entity:")
+            L.append("")
+            for r in seams[:50]:
+                L.append(f"- `{r.get('canonical_iri')}` "
+                         f"(canonical `{r.get('canonical_rel')}`)")
+            L.append("")
+
+    sw = manifest.get("shard_warnings", [])
+    if sw:
+        L.append("### Shard seam warnings")
+        L.append("")
+        for w in sw:
+            L.append(f"- {w}")
+        L.append("")
+
     L.append("## Quarantined")
     L.append("")
     blocked = [q for q in quarantines if q.get("severity") == "block"]
@@ -620,6 +725,40 @@ def cmd_stage(args) -> int:
     if not (workspace / "wiki").is_dir() or not (workspace / "vault").is_dir():
         raise SystemExit(f"receiving workspace missing wiki/ or vault/: {workspace}")
 
+    # Shard ingestion (U4): when --import-shard is given, read the shard
+    # export to learn its seam IRIs — the entity pages inside the shard that
+    # are linked from outside it, i.e. the join keys that rejoin this shard
+    # to its parent. The reconciliation logic is identical to a plain merge;
+    # the seam set only annotates which identity matches are federation seams
+    # (for the audit) and validates the seam pages actually shipped.
+    shard_seam_iris: set[str] = set()
+    shard_warnings: list[str] = []
+    if args.import_shard:
+        shard_path = Path(args.import_shard).expanduser()
+        if ".." in Path(args.import_shard).parts:
+            raise SystemExit(
+                f"refusing shard path with .. segments: {args.import_shard!r}")
+        if not shard_path.is_file():
+            raise SystemExit(f"shard export not found: {shard_path}")
+        try:
+            shard = json.loads(shard_path.read_text())
+        except (json.JSONDecodeError, OSError) as e:
+            raise SystemExit(f"unreadable shard export {shard_path}: {e}")
+        if shard.get("error"):
+            raise SystemExit(f"shard export reports an error: {shard['error']}")
+        for seam in shard.get("seam_entities", []):
+            iri = (seam or {}).get("iri")
+            page = (seam or {}).get("page")
+            if iri:
+                shard_seam_iris.add(iri)
+            if page and not (source / "wiki" / page).is_file():
+                shard_warnings.append(
+                    f"seam entity page {page!r} (iri {iri}) listed in the "
+                    "shard export but absent from the shard's wiki tree; "
+                    "its federation join may be incomplete.")
+        for w in shard_warnings:
+            sys.stderr.write(f"merge: shard — {w}\n")
+
     staging = _ensure_staging(workspace, origin)
     if staging["root"].exists():
         raise SystemExit(
@@ -715,8 +854,48 @@ def cmd_stage(args) -> int:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
 
-    # 2. Page-name collisions.
+    # 2. Identity reconciliation (U1) — runs BEFORE stem collisions.
+    # Match incoming entity pages to existing receiver identities by shared
+    # `iri` first, then by overlapping `same_as` pair. A matched entity
+    # collapses into the receiver's canonical page regardless of slug: we do
+    # not stage it as a live page (that would duplicate the entity under the
+    # incoming slug); instead its framed body is preserved under collisions/
+    # for review, wikilinks to its slug are redirected to the canonical slug,
+    # and its same_as is unioned into the receiver at apply time. The
+    # stem-collision queue (step 3) is the FALLBACK for un-minted pages only.
+    receiver_db = workspace / ".curator" / "identifiers.db"
+    receiver_identity = identity.build_receiver_index(workspace / "wiki", receiver_db)
+    incoming_db = source / ".curator" / "identifiers.db"
+    reconciliations = identity.match_identities(
+        src_wiki, receiver_identity,
+        incoming_db_path=incoming_db if incoming_db.is_file() else None,
+    )
+    # incoming_rel → reconciliation record (collapsed, not a live page).
+    identity_collapse: dict[str, dict] = {}
+    # incoming_slug → canonical_slug, for wikilink redirection (differing
+    # slugs only; same-slug collapses need no link rewrite).
+    slug_redirect: dict[str, str] = {}
+    for r in reconciliations:
+        r["is_seam"] = bool(
+            (r.get("canonical_iri") in shard_seam_iris)
+            or (r.get("incoming_iri") in shard_seam_iris)
+        )
+        # Where the collapsed body is preserved for review: alongside the
+        # canonical page as <canonical-stem>-from-<origin>.md.
+        canon_rel = r.get("canonical_rel") or r["incoming_rel"]
+        r["review_copy_rel"] = reconcile.collision_target_rel(canon_rel, origin)
+        identity_collapse[r["incoming_rel"]] = r
+        inc_slug, canon_slug = r.get("incoming_slug"), r.get("canonical_slug")
+        if inc_slug and canon_slug and inc_slug != canon_slug:
+            slug_redirect[inc_slug] = canon_slug
+
+    # 3. Page-name collisions (stem fallback). Entities already reconciled by
+    # identity are excluded so they don't double-handle.
     collisions = reconcile.find_page_collisions(src_wiki, workspace / "wiki")
+    collisions = [
+        c for c in collisions
+        if str(c["incoming_path"].relative_to(src_wiki)) not in identity_collapse
+    ]
     collision_targets: dict[str, str] = {}
     for c in collisions:
         rel = str(c["incoming_path"].relative_to(src_wiki))
@@ -729,13 +908,21 @@ def cmd_stage(args) -> int:
                 f"__same_topic__:{reconcile.collision_target_rel(rel, origin)}"
             )
 
-    # 3. Walk every incoming wiki page; transform; write to staging.
+    # 4. Walk every incoming wiki page; transform; write to staging.
     manifest_pages: list[dict] = []
     for p in src_wiki.rglob("*.md"):
         rel = str(p.relative_to(src_wiki))
         if any(seg.startswith(".") for seg in rel.split(os.sep)):
             continue
-        if rel in collision_targets:
+        collapsed = identity_collapse.get(rel)
+        if collapsed is not None:
+            # Identity-reconciled entity: never a live page (the receiver's
+            # canonical page wins). Preserve the framed body under
+            # collisions/ for review so incoming knowledge isn't lost and the
+            # receiver isn't overwritten.
+            target_rel = collapsed["review_copy_rel"]
+            staged_under = staging["collisions"]
+        elif rel in collision_targets:
             disp = collision_targets[rel]
             if disp == "__drop__":
                 continue
@@ -753,6 +940,9 @@ def cmd_stage(args) -> int:
         fm, body = _strip_to_allowed_frontmatter(text)
         fm = _apply_origin_and_untrusted(fm, origin)
         body = _rewrite_citations(body, vault_plan["alias_map"])
+        # Redirect wikilinks pointing at any identity-collapsed slug to the
+        # receiver's canonical slug, so the merged graph rejoins on identity.
+        body = _redirect_wikilinks(body, slug_redirect)
         body = _frame_body(body, origin)
         out_text = _format_frontmatter(fm) + body
         out_path = staged_under / target_rel
@@ -768,7 +958,7 @@ def cmd_stage(args) -> int:
             "sha256_at_import": reconcile.sha256_file(out_path),
         })
 
-    # 3b. Mark `vault_missing: true` on source stubs whose cited vault
+    # 4b. Mark `vault_missing: true` on source stubs whose cited vault
     # file isn't present in the staged or receiver vault. The receiving
     # user (and hydrate_vault.py) needs provenance to re-acquire — pull
     # source_url / source_type / sha256 from the incoming export manifest
@@ -826,7 +1016,7 @@ def cmd_stage(args) -> int:
                 "redistributable": meta.get("redistributable", False),
             })
 
-    # 4. Manifest record for vault.
+    # 5. Manifest record for vault.
     manifest_vault: list[dict] = []
     for src_rel, dst_rel in vault_plan["deduped"]:
         manifest_vault.append({
@@ -843,15 +1033,15 @@ def cmd_stage(args) -> int:
             ),
         })
 
-    # 5. Required gates (run on staged content).
+    # 6. Required gates (run on staged content).
     quarantines = _run_required_gates(staging)
-    # 6. Optional gates.
+    # 7. Optional gates.
     optional = _run_optional_gates(staging, args)
     quarantines.extend([q for q in optional if q.get("path")])
     gate_skips = [q for q in optional if not q.get("path") and (q.get("skipped") or q.get("reason"))]
     _quarantine_files(staging, quarantines)
 
-    # 6b. Pre-flight detectors on incoming content. Receivers deserve the
+    # 7b. Pre-flight detectors on incoming content. Receivers deserve the
     # same licensing/PII review the publisher should have done. We always
     # set include_non_native=True because everything from a merge is
     # foreign by definition — that detector would be 100% noise here.
@@ -888,7 +1078,7 @@ def cmd_stage(args) -> int:
     preflight_findings_safe = [preflight.manifest_safe(f)
                                 for f in preflight_findings]
 
-    # 7. Manifest + audit.
+    # 8. Manifest + audit.
     manifest = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "origin": origin,
@@ -907,6 +1097,9 @@ def cmd_stage(args) -> int:
         "accepted_bridges": [],  # populated post-discover-bridges review
         "quarantines": quarantines,
         "missing_vault": missing_vault_marks,
+        "identity_reconciliations": reconciliations,
+        "is_shard_import": bool(args.import_shard),
+        "shard_warnings": shard_warnings,
         "preflight_summary": preflight.manifest_summary(preflight_findings),
         "preflight_findings": preflight_findings_safe,
         "incoming_manifest_warnings": incoming_manifest_warnings,
@@ -968,6 +1161,42 @@ def cmd_apply(args) -> int:
     for src, dst in moves:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dst)
+
+    # Apply identity reconciliations (U1): union each incoming entity's
+    # same_as into the receiver's canonical page frontmatter AND the
+    # `entities` registry. Done here (not at stage time) so staging stays
+    # non-mutating — consistent with the rest of the apply step.
+    receiver_db = workspace / ".curator" / "identifiers.db"
+    id_recs = manifest.get("identity_reconciliations", [])
+    for r in id_recs:
+        union = r.get("union_same_as") or {}
+        canon_rel = r.get("canonical_rel")
+        canon_iri = r.get("canonical_iri")
+        entity_class = r.get("entity_class") or "concept"
+        # 1) Canonical page frontmatter: re-union with whatever it currently
+        # carries (it may have changed since staging) and rewrite same_as.
+        if canon_rel:
+            page = receiver_wiki / canon_rel
+            if page.is_file():
+                text = page.read_text(errors="replace")
+                cur_fm, _ = read_frontmatter(text)
+                merged = identity.union_same_as(
+                    identity.parse_same_as(cur_fm.get("same_as")), union)
+                if merged:
+                    updated = set_frontmatter_field(
+                        text, "same_as", identity.format_same_as_list(merged))
+                    if updated != text:
+                        page.write_text(updated)
+        # 2) IRI registry: union into the receiver's entities table.
+        if canon_iri:
+            try:
+                identity.upsert_entity_union(
+                    receiver_db, canon_iri, entity_class=entity_class,
+                    page_path=canon_rel, same_as=union)
+            except sqlite3.DatabaseError as e:
+                sys.stderr.write(
+                    f"merge: could not update identity registry for "
+                    f"{canon_iri}: {e}\n")
 
     # Persist manifest at .curator/merges/<origin>.json (used by unmerge).
     merges_dir = workspace / ".curator" / "merges"

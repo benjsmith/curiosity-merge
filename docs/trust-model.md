@@ -80,6 +80,12 @@ A merged wiki ships a thousand near-duplicate vault files designed to bloat the 
 
 **Defense.** Vault dedup happens at staging time, before anything lands in the live tree. The audit report shows total bytes added; the user can refuse the merge if the number is unreasonable. There is no automatic size cap — the user makes that call.
 
+### T9. Identity-spoofing in IRI reconciliation
+
+A merged entity page carries an `iri:` or a `same_as:` pair that collides with a real receiver entity it isn't — e.g. claims `same_as: [pubchem:CID2244]` (aspirin) on a page whose prose is about something else, hoping to collapse into and distort the receiver's canonical aspirin page.
+
+**Defense.** Identity reconciliation is **additive and non-destructive on the receiver side**. The receiver's page is always canonical; it is never overwritten by incoming (untrusted) content. The matched incoming body is preserved under `collisions/<canonical-stem>-from-<origin>.md` — same posture as a same-topic stem collision (T5) — tagged `untrusted: true` and origin-framed for human review, not folded in automatically. The only thing written into the receiver is the **union of `same_as` pairs** (into the canonical page's frontmatter and the `entities` registry); a spoofed claim can at most attach extra `authority:id` pairs to an entity the receiver already owns. Every identity match — which IRIs matched, by `iri` or by which `same_as` pair, which slugs collapsed — is enumerated in the audit report's `## Identity reconciliation` section so the user reviews each collapse before approving the merge. Reconciliation only ever *collapses* an incoming page into an existing receiver identity; a first-seen entity (no receiver match) flows through the normal page path untouched.
+
 ## Quality and security gating before merge applies
 
 Defenses T1–T8 above are mechanical and always run. On top of those, **`merge` runs a quality/security gating pass on every staged page and every staged vault file before the audit report is written**. Anything that trips a gate goes to `.curator/.merge-staging/<origin>/_suspect/` (quarantine) and is listed in the audit report under `## Quarantined`. The user can re-include a quarantined item only by editing the staging directory directly — the apply step refuses to silently promote anything from `_suspect/`.

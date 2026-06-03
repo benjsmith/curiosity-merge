@@ -1,5 +1,60 @@
 # Changelog
 
+## v0.6.0 — 2026-06-02
+
+IRI-keyed entity reconciliation and shard ingestion — the curiosity-merge
+side of curiosity-engine v0.5.0's U1 (entity identity) and U4 (shard export)
+contract. Reconciliation upgrades from slug-keyed to identity-keyed; the
+stem queue becomes the fallback for un-minted pages.
+
+### Identity reconciliation (U1)
+
+New module `scripts/identity.py` (pure functions, mirrors `reconcile.py`).
+Before the stem-collision pass, `merge` now matches incoming entity pages to
+existing receiver identities by shared `iri` first, then by overlapping
+`same_as` `authority:id` pair. Identity is read from both the receiver's
+`.curator/identifiers.db` `entities` table and page frontmatter (`iri`,
+`same_as`, `entity_class`) — exports ship the wiki tree, not the db, so
+frontmatter is the reliable carrier.
+
+- A matched entity collapses into the receiver's canonical page **regardless
+  of slug**. It is not re-staged as a live page (its framed body is preserved
+  under `collisions/<canonical-stem>-from-<origin>.md` for review), wikilinks
+  to its slug are redirected to the canonical slug, and its `same_as` map is
+  unioned into the receiver's page frontmatter and `entities` registry at
+  apply time (mirroring curiosity-engine `write_entity`'s union semantics).
+- The receiver `entities` table is read read-only via `PRAGMA query_only=ON`
+  on a normal connection — NOT the `mode=ro` URI, which hangs on live
+  WAL-mode dbs.
+- **Backward-compatible by construction**: a wiki with no minted IRIs and no
+  `iri:`/`same_as:` frontmatter yields an empty identity map, so the stem
+  flow runs exactly as before.
+
+### Shard ingestion (U4)
+
+New `merge.py --import-shard <export.json> <shard-wiki> --as-origin <name>`.
+Reads `seam_entities[].iri` from an `epoch_summary.py --shard` export and
+reconciles on those seam IRIs — a seam entity the parent already holds
+rejoins its canonical page instead of duplicating. Apply/abandon use the
+normal merge verbs.
+
+### Audit report
+
+New `## Identity reconciliation` section, distinct from the stem-based
+`## Page-name collisions`: which IRIs matched (by `iri` vs `same_as`), which
+slugs collapsed, and — for shard imports — which were seam joins. New
+manifest keys: `identity_reconciliations`, `is_shard_import`,
+`shard_warnings`. Preserved across `--rerun-gates`.
+
+### Tests
+
+New `tests/test_identity.py`: 10 tests covering `identity.py`'s pure
+functions in-process plus end-to-end same_as-overlap reconciliation,
+same-IRI shard rejoin, `same_as` union into page + db on apply, and the
+no-IRI backward-compat path. E2E fixtures mint real IRIs via
+curiosity-engine's `identifier_cache.py mint-entity` so the reconciler reads
+the genuine `entities` table.
+
 ## v0.5.0 — 2026-05-12
 
 Two substantive Presidio enhancements from the v0.4.0 backlog.
