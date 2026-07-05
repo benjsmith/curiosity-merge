@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 from conftest import run_script
@@ -86,6 +87,224 @@ def test_subgraph_export_rejects_path_traversal(wiki_a: Path, env_with_ce):
     )
     assert res.returncode != 0
     assert ".." in (res.stderr + res.stdout)
+
+
+# --- subgraph-export --pages-file (v0.7.0) --------------------------------
+
+
+def test_pages_file_exports_exact_set(wiki_a: Path, env_with_ce, tmp_path):
+    """Refs resolve as bare stem, wiki-relative path, path-with-.md, and
+    case-insensitively — same matching as --page. No 1-hop expansion."""
+    refs = tmp_path / "refs.json"
+    refs.write_text(json.dumps([
+        "transformer",                # bare stem
+        "concepts/attention",         # wiki-relative path
+        "Projects/ML-Foundations.md", # path with .md, mixed case
+    ]))
+    out = tmp_path / "export-pf"
+    run_script(
+        "subgraph_export.py",
+        "--pages-file", str(refs),
+        "--to", str(out),
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["scope"]["kind"] == "pages-file"
+    assert set(manifest["scope_pages"]) == {
+        "concepts/transformer.md",
+        "concepts/attention.md",
+        "projects/ml-foundations.md",
+    }
+    # No 1-hop: sources/vaswani-2017-attention.md is wikilinked from
+    # transformer but was not listed, so it must not ride along.
+    assert "sources/vaswani-2017-attention.md" not in manifest["scope_pages"]
+
+
+def test_pages_file_missing_refs_error_lists_all(
+        wiki_a: Path, env_with_ce, tmp_path):
+    refs = tmp_path / "refs.json"
+    refs.write_text(json.dumps(["transformer", "no-such-page", "also-missing"]))
+    res = run_script(
+        "subgraph_export.py",
+        "--pages-file", str(refs),
+        "--to", str(tmp_path / "export-miss"),
+        "--workspace", str(wiki_a),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    err = res.stderr + res.stdout
+    assert "no-such-page" in err
+    assert "also-missing" in err
+
+
+def test_pages_file_skip_missing_continues(
+        wiki_a: Path, env_with_ce, tmp_path):
+    refs = tmp_path / "refs.json"
+    refs.write_text(json.dumps(["transformer", "no-such-page"]))
+    out = tmp_path / "export-skip"
+    res = run_script(
+        "subgraph_export.py",
+        "--pages-file", str(refs),
+        "--skip-missing",
+        "--to", str(out),
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "no-such-page" in res.stderr
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["scope_pages"] == ["concepts/transformer.md"]
+
+
+def test_pages_file_mutually_exclusive_with_other_scopes(
+        wiki_a: Path, env_with_ce, tmp_path):
+    refs = tmp_path / "refs.json"
+    refs.write_text(json.dumps(["transformer"]))
+    res = run_script(
+        "subgraph_export.py",
+        "--pages-file", str(refs),
+        "--project", "ml-foundations",
+        "--to", str(tmp_path / "export-x"),
+        "--workspace", str(wiki_a),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "not allowed with" in (res.stderr + res.stdout)
+
+
+def test_pages_file_rejects_include_1_hop(
+        wiki_a: Path, env_with_ce, tmp_path):
+    refs = tmp_path / "refs.json"
+    refs.write_text(json.dumps(["transformer"]))
+    res = run_script(
+        "subgraph_export.py",
+        "--pages-file", str(refs),
+        "--include-1-hop",
+        "--to", str(tmp_path / "export-x"),
+        "--workspace", str(wiki_a),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "--include-1-hop" in (res.stderr + res.stdout)
+
+
+def test_pages_file_rejects_non_list_json(
+        wiki_a: Path, env_with_ce, tmp_path):
+    refs = tmp_path / "refs.json"
+    refs.write_text(json.dumps({"pages": ["transformer"]}))
+    res = run_script(
+        "subgraph_export.py",
+        "--pages-file", str(refs),
+        "--to", str(tmp_path / "export-x"),
+        "--workspace", str(wiki_a),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "JSON list" in (res.stderr + res.stdout)
+
+
+# --- subgraph-export figure embeds (v0.7.0) -------------------------------
+
+
+def test_export_collects_figure_embeds(
+        wiki_a_with_figures: Path, env_with_ce, tmp_path):
+    """All three embed path forms ship at the same wiki-relative path;
+    figures referenced only from out-of-scope pages stay behind."""
+    out = tmp_path / "export-figs"
+    run_script(
+        "subgraph_export.py",
+        "--project", "ml-foundations",
+        "--to", str(out),
+        "--workspace", str(wiki_a_with_figures),
+        env=env_with_ce,
+    )
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["scope_figures"] == [
+        "figures/_assets/arch.png",
+        "figures/_assets/attn-diagram.png",
+        "figures/_assets/heads.png",
+    ]
+    for rel in manifest["scope_figures"]:
+        assert (out / "wiki" / rel).is_file()
+    # unrelated.png is embedded only from a page outside the project.
+    assert not (out / "wiki" / "figures" / "_assets" / "unrelated.png").exists()
+
+
+def test_export_missing_figure_warns_but_succeeds(
+        wiki_a: Path, env_with_ce, tmp_path):
+    page = wiki_a / "wiki" / "concepts" / "transformer.md"
+    page.write_text(page.read_text() + "\n![gone](figures/_assets/gone.png)\n")
+    out = tmp_path / "export-figmiss"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "ml-foundations",
+        "--to", str(out),
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "figure asset not found" in res.stderr
+    assert "gone.png" in res.stderr
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["scope_figures"] == []
+
+
+def test_export_figure_embeds_skip_external_and_non_image(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """External image URLs and non-image transclusions are not figure
+    embeds — no copy, no missing-figure warning."""
+    page = wiki_a / "wiki" / "concepts" / "transformer.md"
+    page.write_text(page.read_text() + """\
+
+![remote](https://example.org/remote.png)
+![[attention]]
+""")
+    out = tmp_path / "export-figskip"
+    res = run_script(
+        "subgraph_export.py",
+        "--project", "ml-foundations",
+        "--to", str(out),
+        "--workspace", str(wiki_a),
+        env=env_with_ce,
+    )
+    assert "figure asset not found" not in res.stderr
+    manifest = json.loads((out / "_export-manifest.json").read_text())
+    assert manifest["scope_figures"] == []
+
+
+# --- subgraph-export headless invocation (v0.7.0) --------------------------
+
+
+def test_export_headless_no_preflight_force_never_prompts(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """The documented headless/local combination: --no-preflight --force
+    with stdin fully closed must complete without prompting or blocking,
+    even with PII-bearing content and a non-empty destination."""
+    _write_page = wiki_a / "wiki" / "concepts" / "pii-page.md"
+    _write_page.write_text("""\
+---
+title: PII Page
+type: concept
+projects: [ml-foundations]
+---
+
+Contact chain: alice@corp-mail.com, bob@corp-mail.com, SSN 123-45-6789.
+""")
+    out = tmp_path / "export-headless"
+    out.mkdir()
+    (out / "stale.txt").write_text("pre-existing")  # non-empty destination
+    cmd = ["uv", "run", "python3",
+           str(Path(__file__).resolve().parent.parent
+               / "scripts" / "subgraph_export.py"),
+           "--project", "ml-foundations",
+           "--no-preflight", "--force",
+           "--to", str(out),
+           "--workspace", str(wiki_a)]
+    res = subprocess.run(
+        cmd, env=env_with_ce, capture_output=True, text=True,
+        stdin=subprocess.DEVNULL, timeout=120,
+    )
+    assert res.returncode == 0, res.stderr
+    assert (out / "_export-manifest.json").is_file()
 
 
 # --- merge -----------------------------------------------------------------

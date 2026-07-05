@@ -228,6 +228,50 @@ Body.
 
 
 @pytest.fixture
+def wiki_a_with_figures(wiki_a: Path) -> Path:
+    """wiki_a extended with figure assets under wiki/figures/_assets/ and
+    image embeds in the ml-foundations pages, covering all three embed
+    path forms (wiki-relative, _assets-relative, bare legacy short-form)
+    plus a page outside the project whose figure must NOT ride along.
+    """
+    assets = wiki_a / "wiki" / "figures" / "_assets"
+    assets.mkdir(parents=True)
+    (assets / "arch.png").write_bytes(b"\x89PNG arch")
+    (assets / "heads.png").write_bytes(b"\x89PNG heads")
+    (assets / "attn-diagram.png").write_bytes(b"\x89PNG attn")
+    (assets / "unrelated.png").write_bytes(b"\x89PNG unrelated")
+
+    # Markdown embed (wiki-relative path) + Obsidian bare short-form.
+    transformer = wiki_a / "wiki" / "concepts" / "transformer.md"
+    transformer.write_text(transformer.read_text() + """\
+
+![architecture](figures/_assets/arch.png)
+![[heads.png]]
+""")
+    # Figure page with the figure-page-relative `_assets/` form.
+    _write(wiki_a / "wiki" / "figures" / "attn-diagram.md", """\
+---
+title: Attention diagram
+type: figure
+projects: [ml-foundations]
+---
+
+![[_assets/attn-diagram.png|Attention diagram]]
+""")
+    # Out-of-scope page: its figure must not ride along with ml-foundations.
+    _write(wiki_a / "wiki" / "concepts" / "other-topic.md", """\
+---
+title: Other Topic
+type: concept
+projects: [other-project]
+---
+
+![unrelated](figures/_assets/unrelated.png)
+""")
+    return wiki_a
+
+
+@pytest.fixture
 def wiki_b(tmp_path: Path, wiki_a: Path) -> Path:
     """Source wiki. Generative-models project with a transformer page
     that collides with wiki-a's, plus a unique diffusion concept. Vault

@@ -2,10 +2,11 @@
 """subgraph_export.py — extract a self-contained mini-wiki from a curiosity-
 engine workspace.
 
-Three scopes:
+Four scopes:
   --project <name>    pages tagged projects: [<name>]
   --page <stem>       a single page; with --include-1-hop adds wikilink neighbors
   --origin <name>     pages tagged origin: <name> (only meaningful post-merge)
+  --pages-file <path> an explicit page set (JSON list of refs); no 1-hop
 
 The destination is a normal curiosity-engine wiki layout (vault/, wiki/,
 .curator/projects.json) plus _export-manifest.json. Suitable for git push
@@ -109,6 +110,42 @@ def _page_origin(text: str) -> str:
 # --- scope resolution ------------------------------------------------------
 
 
+def _match_page_ref(ref: str, all_pages: list[Path], wiki_dir: Path) -> Path | None:
+    """Resolve a page ref to a wiki page, or None if nothing matches.
+
+    A ref is either a bare stem ("transformer") or a wiki-relative path
+    with optional .md suffix ("concepts/transformer"). Matching is
+    case-insensitive and hyphenated like wikilink targets.
+    """
+    target = ref.strip().lower().replace(" ", "-")
+    if target.endswith(".md"):
+        target = target[:-len(".md")]
+    return next(
+        (p for p in all_pages if p.stem.lower() == target
+         or str(p.relative_to(wiki_dir)).lower().replace(".md", "") == target),
+        None,
+    )
+
+
+def _load_page_refs(path_arg: str) -> list[str]:
+    """Read a --pages-file: a JSON list of page-ref strings."""
+    p = Path(path_arg).expanduser()
+    try:
+        data = json.loads(p.read_text())
+    except OSError as e:
+        raise SystemExit(f"pages-file: cannot read {p}: {e}")
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"pages-file: invalid JSON in {p}: {e}")
+    if not isinstance(data, list) or not all(isinstance(r, str) for r in data):
+        raise SystemExit(
+            f"pages-file: expected a JSON list of page-ref strings in {p}"
+        )
+    refs = [r.strip() for r in data if r.strip()]
+    if not refs:
+        raise SystemExit(f"pages-file: no page refs in {p}")
+    return refs
+
+
 def _resolve_scope_pages(args, all_pages: list[Path], wiki_dir: Path) -> list[Path]:
     if args.project:
         return [
@@ -122,13 +159,8 @@ def _resolve_scope_pages(args, all_pages: list[Path], wiki_dir: Path) -> list[Pa
         ]
     if args.page:
         # Match by stem (case-insensitive, hyphenated like wikilink targets).
-        target = args.page.strip().lower().replace(" ", "-")
         # Allow either bare stem or stem-with-subdir.
-        match = next(
-            (p for p in all_pages if p.stem.lower() == target
-             or str(p.relative_to(wiki_dir)).lower().replace(".md", "") == target),
-            None,
-        )
+        match = _match_page_ref(args.page, all_pages, wiki_dir)
         if not match:
             raise SystemExit(f"page not found: {args.page!r}")
         seeds = [match]
@@ -142,7 +174,37 @@ def _resolve_scope_pages(args, all_pages: list[Path], wiki_dir: Path) -> list[Pa
                 out.append(p)
                 seen.add(p)
         return out
-    raise SystemExit("must pass one of --project / --page / --origin")
+    if args.pages_file:
+        # Explicit page set — the caller computed the scope itself (e.g.
+        # a workbench UI selection). Deliberately no 1-hop expansion:
+        # the file IS the scope.
+        refs = _load_page_refs(args.pages_file)
+        out = []
+        seen = set()
+        misses: list[str] = []
+        for ref in refs:
+            match = _match_page_ref(ref, all_pages, wiki_dir)
+            if match is None:
+                misses.append(ref)
+            elif match not in seen:
+                out.append(match)
+                seen.add(match)
+        if misses:
+            if not args.skip_missing:
+                listing = "\n".join(f"  - {r}" for r in misses)
+                raise SystemExit(
+                    f"pages-file: {len(misses)} ref(s) matched no wiki page:\n"
+                    f"{listing}\n"
+                    "(pass --skip-missing to export the matched pages anyway)"
+                )
+            sys.stderr.write(
+                f"pages-file: skipped {len(misses)} unmatched ref(s): "
+                + ", ".join(misses) + "\n"
+            )
+        return out
+    raise SystemExit(
+        "must pass one of --project / --page / --origin / --pages-file"
+    )
 
 
 def _one_hop_neighbors(page: Path, all_pages: list[Path], wiki_dir: Path) -> list[Path]:
@@ -344,6 +406,83 @@ def _collect_cited_vault(scope_pages: list[Path], vault_dir: Path) -> list[Path]
     return out
 
 
+# --- figure-embed collection -------------------------------------------
+
+
+# Image embed forms used by the wiki format (mirroring curiosity-engine's
+# wiki_render.py): Obsidian transclusion `![[path]]` (optional `|alt`) and
+# standard markdown `![alt](path)`.
+_IMG_EMBED_RE = re.compile(r"!\[\[([^\]]+)\]\]")
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_FIGURE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp"}
+
+
+def _normalise_figure_path(path: str) -> str:
+    """Map a figure-asset reference to its wiki-relative form.
+
+    Mirrors curiosity-engine wiki_render._normalise_asset_path:
+      `figures/_assets/X.png`  → unchanged (already wiki-relative)
+      `_assets/X.png`          → `figures/_assets/X.png` (figure-page-relative)
+      `X.png` (no slash)       → `figures/_assets/X.png` (legacy short-form)
+      anything else            → unchanged (treated as wiki-relative)
+    """
+    path = path.strip()
+    if path.startswith("figures/_assets/"):
+        return path
+    if path.startswith("_assets/"):
+        return "figures/" + path
+    if "/" not in path:
+        return "figures/_assets/" + path
+    return path
+
+
+def _collect_figure_embeds(scope_pages: list[Path],
+                           wiki_dir: Path) -> tuple[list[Path], list[tuple[str, str]]]:
+    """Resolve every image embed in scope pages to a file under wiki/.
+
+    Returns (existing figure files, missing (rel, page-rel) pairs). Only
+    refs with an image suffix are collected — an `![[X]]` transclusion of
+    a non-image page is not a figure embed. Missing files are the
+    caller's to warn about; a broken embed shouldn't fail the export.
+    """
+    ref_to_page: dict[str, str] = {}
+    for p in scope_pages:
+        text = p.read_text(errors="replace")
+        targets: list[str] = []
+        for m in _IMG_EMBED_RE.finditer(text):
+            # Obsidian's `![[X|alt]]` syntax — drop the alt part.
+            targets.append(m.group(1).split("|", 1)[0])
+        for m in _MD_IMAGE_RE.finditer(text):
+            targets.append(m.group(1))
+        for target in targets:
+            if "://" in target:
+                continue  # external image URL, not a wiki asset
+            rel = _normalise_figure_path(target)
+            if Path(rel).suffix.lower() not in _FIGURE_SUFFIXES:
+                continue
+            ref_to_page.setdefault(rel, str(p.relative_to(wiki_dir)))
+    out: list[Path] = []
+    missing: list[tuple[str, str]] = []
+    for rel in sorted(ref_to_page):
+        # Defense in depth: refuse traversal in embed paths (mirrors
+        # _collect_cited_vault). Escaping refs count as missing so the
+        # broken image is visible rather than silently dropped.
+        if ".." in Path(rel).parts or Path(rel).is_absolute():
+            missing.append((rel, ref_to_page[rel]))
+            continue
+        candidate = (wiki_dir / rel).resolve()
+        try:
+            candidate.relative_to(wiki_dir.resolve())
+        except ValueError:
+            missing.append((rel, ref_to_page[rel]))
+            continue
+        if candidate.is_file():
+            out.append(candidate)
+        else:
+            missing.append((rel, ref_to_page[rel]))
+    return out, missing
+
+
 def _filter_vault_for_mode(vault_files: list[Path], mode: str,
                             allowlist: set[str] | None = None) -> list[Path]:
     """Apply --include-vault mode. Default `none` is sharing-safe."""
@@ -391,6 +530,18 @@ def _copy_vault(vault_files: list[Path], vault_dir: Path, dest_vault: Path) -> l
     return sorted(rels)
 
 
+def _copy_figures(figure_files: list[Path], wiki_dir: Path,
+                  dest_wiki: Path) -> list[str]:
+    rels: list[str] = []
+    for f in figure_files:
+        rel = f.relative_to(wiki_dir)
+        target = dest_wiki / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, target)
+        rels.append(str(rel))
+    return sorted(rels)
+
+
 def _filter_projects_json(workspace: Path, dest_curator: Path,
                           scope_kind: str, scope_value: str,
                           scope_projects: set[str]) -> None:
@@ -422,6 +573,7 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
                     include_1_hop: bool, origin_wiki: Path,
                     origin_label: str | None,
                     scope_pages_rel: list[str], scope_vault_rel: list[str],
+                    scope_figures_rel: list[str],
                     vault_metadata: list[dict],
                     include_vault_mode: str,
                     preflight_findings: list[dict] | None = None,
@@ -462,6 +614,7 @@ def _write_manifest(dest: Path, *, scope_kind: str, scope_value: str,
         "include_vault_mode": include_vault_mode,
         "scope_pages": scope_pages_rel,
         "scope_vault": scope_vault_rel,
+        "scope_figures": scope_figures_rel,
         "vault_metadata": vault_metadata,
         "preflight_summary": preflight.manifest_summary(findings),
     }
@@ -549,6 +702,17 @@ def main(argv: list[str] | None = None) -> int:
                        help="export a single page (stem or path/stem)")
     scope.add_argument("--origin", metavar="NAME",
                        help="export pages tagged origin: NAME")
+    scope.add_argument("--pages-file", metavar="PATH",
+                       help="export an explicit page set: PATH is a JSON "
+                            "list of page refs, each a bare stem "
+                            "('transformer') or wiki-relative path with "
+                            "optional .md ('concepts/transformer'). Same "
+                            "case-insensitive matching as --page; no 1-hop "
+                            "expansion. Refs that match nothing error "
+                            "(all misses listed) unless --skip-missing.")
+    ap.add_argument("--skip-missing", action="store_true",
+                    help="for --pages-file, report unmatched refs on "
+                         "stderr and continue instead of erroring")
     ap.add_argument("--include-1-hop", action="store_true",
                     help="for --page, also include wikilink neighbors (1 hop)")
     ap.add_argument("--to", metavar="PATH", required=False, default=None,
@@ -663,6 +827,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.include_1_hop and not args.page:
         ap.error("--include-1-hop only makes sense with --page")
+    if args.skip_missing and not args.pages_file:
+        ap.error("--skip-missing only makes sense with --pages-file")
 
     workspace = Path(args.workspace).resolve()
     wiki_dir = workspace / "wiki"
@@ -679,9 +845,9 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_clear_acks(workspace, auto_yes=args.accept_on == "all")
 
     # Below here, we're doing an export — scope and --to are required.
-    if not (args.project or args.page or args.origin):
+    if not (args.project or args.page or args.origin or args.pages_file):
         raise SystemExit(
-            "must pass one of --project / --page / --origin "
+            "must pass one of --project / --page / --origin / --pages-file "
             "(or --list-acks / --clear-acks for ack management)"
         )
     if not args.to:
@@ -730,6 +896,17 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     cited_vault_files = _collect_cited_vault(scope_pages, vault_dir)
+
+    # Figure assets ride along like vault citations: every image embed
+    # reachable from an in-scope page ships at the same wiki-relative
+    # path. Missing assets warn rather than fail — the embed is already
+    # broken in the source wiki; the export shouldn't be blocked on it.
+    figure_files, missing_figures = _collect_figure_embeds(scope_pages, wiki_dir)
+    for rel, page_rel in missing_figures:
+        sys.stderr.write(
+            f"subgraph-export: warning: figure asset not found: {rel} "
+            f"(embedded in {page_rel})\n"
+        )
 
     # Build vault metadata (always recorded) BEFORE applying the
     # include-vault filter, so the manifest captures the full citation
@@ -917,12 +1094,18 @@ def main(argv: list[str] | None = None) -> int:
 
     pages_rel = _copy_pages(scope_pages, wiki_dir, dest_wiki)
     vault_rel = _copy_vault(vault_files, vault_dir, dest_vault)
+    figures_rel = _copy_figures(figure_files, wiki_dir, dest_wiki)
 
     if args.project:
         kind, value = "project", args.project
         scope_projects = {args.project}
     elif args.page:
         kind, value = "page", args.page
+        scope_projects = set()
+        for p in scope_pages:
+            scope_projects.update(_page_projects(p.read_text(errors="replace")))
+    elif args.pages_file:
+        kind, value = "pages-file", args.pages_file
         scope_projects = set()
         for p in scope_pages:
             scope_projects.update(_page_projects(p.read_text(errors="replace")))
@@ -941,6 +1124,7 @@ def main(argv: list[str] | None = None) -> int:
         origin_label=args.label,
         scope_pages_rel=pages_rel,
         scope_vault_rel=vault_rel,
+        scope_figures_rel=figures_rel,
         vault_metadata=vault_metadata,
         include_vault_mode=args.include_vault,
         preflight_findings=findings,
@@ -949,10 +1133,16 @@ def main(argv: list[str] | None = None) -> int:
 
     omitted = len(vault_metadata) - len(vault_rel)
     msg = (
-        f"exported {len(pages_rel)} pages and {len(vault_rel)} vault files "
-        f"to {dest}\n"
+        f"exported {len(pages_rel)} pages, {len(vault_rel)} vault files, "
+        f"and {len(figures_rel)} figure asset(s) to {dest}\n"
         f"manifest: {dest / '_export-manifest.json'}\n"
     )
+    if missing_figures:
+        msg += (
+            f"note: {len(missing_figures)} embedded figure asset(s) not "
+            f"found in the source wiki (warned above); embeds will render "
+            f"broken until regenerated via figures.py.\n"
+        )
     if omitted > 0:
         msg += (
             f"note: {omitted} cited vault file(s) omitted "

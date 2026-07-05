@@ -53,11 +53,19 @@ uv run python3 <skill_path>/scripts/subgraph_export.py \
     --page <stem> --include-1-hop --to <path>
 uv run python3 <skill_path>/scripts/subgraph_export.py \
     --origin <name> --to <path>
+uv run python3 <skill_path>/scripts/subgraph_export.py \
+    --pages-file <refs.json> [--skip-missing] --to <path>
 ```
 
 Writes a normal curiosity-engine wiki layout at `<path>` (`vault/`, `wiki/`, `.curator/projects.json`) plus an `_export-manifest.json` recording the scope. The destination is suitable for `git init && git push` to a public repo for sharing — tag the repo with `curiosity-wiki` for discovery.
 
+**`--pages-file`** (v0.7.0) exports an explicit page set: the file is a JSON list of page refs, each either a bare stem (`"transformer"`) or a wiki-relative path with optional `.md` (`"concepts/transformer"`). Refs resolve with the same case-insensitive stem/path matching as `--page`, but there is deliberately no 1-hop expansion — the file IS the scope (the caller computed it, e.g. a workbench UI selection). Refs that match nothing fail the export with every miss listed; pass `--skip-missing` to report misses on stderr and export the matched pages anyway.
+
 Vault files are included transitively: every `(vault:...)` citation reachable from an in-scope wiki page brings the cited file along. A receiving workspace runs `curiosity-merge merge ./that-clone --as-origin <name>` to absorb it.
+
+**Figure assets ride along too** (v0.7.0): every image embed reachable from an in-scope page — markdown `![alt](figures/_assets/x.png)` and Obsidian `![[x.png]]` / `![[_assets/x.png]]` forms, normalized the same way curiosity-engine's `wiki_render.py` normalizes them — is copied into the export at the same wiki-relative path (`wiki/figures/_assets/...`) and listed under `scope_figures` in the manifest. A missing asset warns on stderr but never fails the export (assets are regenerable via curiosity-engine's `figures.py regen`). External image URLs and non-image transclusions are ignored.
+
+**Headless / local invocation** (audited v0.7.0): `--no-preflight --force` is the supported never-prompt combination for programmatic callers (e.g. local-to-local transfers where the publish-oriented licensing/PII gates are wrong-purpose). `--no-preflight` skips the entire preflight pass — the interactive `[y/N/a]` prompt is the only stdin read on the export path, and it lives inside that pass; `--force` removes the only other stop (the non-empty-destination refusal). Everything else either succeeds or exits nonzero with a message; nothing reads stdin or waits on a TTY. (Even without `--no-preflight`, a prompt-needing finding with no TTY exits nonzero rather than hanging — but headless callers should skip the gates explicitly.) For a local page move you'll typically also want `--include-vault=all` and, if origin-tagged pages are in the set, `--include-non-native`.
 
 ### `discover-bridges` — find unwritten cross-page links
 

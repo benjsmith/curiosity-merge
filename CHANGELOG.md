@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.7.0 — 2026-07-05
+
+Three small, standalone upgrades to `subgraph_export.py`, motivated by
+composition with external callers (a workbench app driving exports
+programmatically) but each useful to CLI users on its own.
+
+### `--pages-file` — explicit page-set scope
+
+A fourth scope selector alongside `--project` / `--page` / `--origin`
+(mutually exclusive with them). The file is a JSON list of page refs,
+each either a bare stem (`"transformer"`) or a wiki-relative path with
+optional `.md` (`"concepts/transformer"`). Refs resolve with the same
+case-insensitive stem/path matching as `--page`.
+
+- Deliberately **no 1-hop expansion** — the file IS the scope
+  (`--include-1-hop` with `--pages-file` errors at parse time).
+- Refs that match nothing fail the export with **every miss listed**;
+  new `--skip-missing` reports misses on stderr and continues with the
+  matched pages instead.
+- Manifest `scope.kind` is `pages-file`; duplicates in the file
+  de-dupe; order-preserving resolution.
+
+### Figure assets ride along (fixes silently-broken images)
+
+Exports previously shipped wiki pages but not the figure assets they
+embed, so rendered/published pages arrived with broken images. Image
+embeds are now collected the same way `(vault:...)` citations are:
+every `figures/_assets/` file referenced from an in-scope page is
+copied into the export at the same wiki-relative path.
+
+- Covers both reference forms the wiki format uses (per
+  curiosity-engine's `wiki_render.py`): markdown `![alt](path)` and
+  Obsidian transclusion `![[path]]` / `![[path|alt]]`, with the same
+  path normalization (`figures/_assets/X` / `_assets/X` / bare `X.png`).
+- Missing assets **warn, never fail** — the embed was already broken in
+  the source wiki, and assets are regenerable via curiosity-engine's
+  `figures.py regen`. External image URLs and non-image transclusions
+  are ignored (no copy, no warning).
+- Embed paths get the same traversal guard as vault citations.
+- New manifest key `scope_figures` (wiki-relative list, like
+  `scope_pages` / `scope_vault`); additive, so the manifest schema
+  version stays at 2. The stdout summary now reports the figure count.
+
+### Headless/local invocation audited and documented
+
+For non-interactive callers (local-to-local transfers where the
+publish-oriented licensing/PII gates are wrong-purpose), the full
+export code path was audited for prompts, TTY assumptions, and blocking
+findings. Conclusion: **`--no-preflight --force` already fully covers
+headless use** — no new flag needed.
+
+- The interactive `[y/N/a]` prompt is the only stdin read on the export
+  path and lives inside the preflight pass that `--no-preflight` skips
+  entirely; `--force` removes the only other stop (non-empty
+  destination). Every other exit is a clean nonzero error; nothing
+  waits on a TTY. (`--clear-acks`' confirmation prompt is a separate
+  management command, not an export path.)
+- Documented in SKILL.md as the supported headless/local combination,
+  with a regression test that runs an export with stdin closed
+  (`stdin=DEVNULL`), PII-bearing content, and a non-empty destination.
+
+### Tests
+
+172 active tests passing (was 162 at v0.6.0). 10 new:
+
+- `--pages-file` (6): exact-set export across all ref forms + no-1-hop,
+  missing refs error lists all misses, `--skip-missing` continues,
+  mutual exclusion with other scopes, `--include-1-hop` rejection,
+  non-list JSON rejection.
+- Figure embeds (4 incl. headless): all three embed path forms ship +
+  out-of-scope figures stay behind, missing figure warns but succeeds,
+  external URLs / non-image transclusions ignored, headless
+  `--no-preflight --force` never prompts.
+
 ## v0.6.0 — 2026-06-02
 
 IRI-keyed entity reconciliation and shard ingestion — the curiosity-merge
