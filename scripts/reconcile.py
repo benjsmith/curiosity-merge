@@ -48,6 +48,40 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# Untrusted-merge framing written by merge.py `_frame_body`. Apply-time
+# comparisons must ignore it: a staged page is always framed, so a
+# whole-body hash would never match the receiver (or a previously-applied
+# framed page from another origin).
+_UNTRUSTED_FRAME_RE = re.compile(
+    r"<!-- BEGIN UNTRUSTED MERGED CONTENT — origin:[a-z0-9][a-z0-9_-]{0,63} -->\s*"
+    r"(.*?)"
+    r"\s*<!-- END UNTRUSTED MERGED CONTENT -->",
+    re.DOTALL,
+)
+
+
+def page_body(text: str) -> str:
+    """Frontmatter-stripped body, with merge framing removed if present.
+
+    Leading/trailing whitespace is stripped so an otherwise-identical
+    page whose export only differs in YAML (`updated:`, `projects:`,
+    a newly minted `iri:`) still hashes as identical. Internal
+    whitespace is preserved — a curator rewrite is a real edit.
+    """
+    _, body = read_frontmatter(text)
+    m = _UNTRUSTED_FRAME_RE.search(body)
+    if m:
+        body = m.group(1)
+    return body.strip()
+
+
+def body_sha256(path: Path) -> str:
+    """sha256 of `page_body` for the file at `path`."""
+    return hashlib.sha256(
+        page_body(path.read_text(errors="replace")).encode("utf-8")
+    ).hexdigest()
+
+
 def index_vault(vault_dir: Path) -> dict[str, str]:
     """Map sha256 -> first relative path that hashes to it.
 
@@ -171,8 +205,24 @@ def classify_collision(
     fall back to a length-and-overlap heuristic that's right most of the
     time but biased toward `same_topic` (better to ask the human than to
     silently pick wrong).
+
+    `identical` is **body** identity, not whole-file identity. Two pages
+    whose prose matches but whose frontmatter differs (`updated:`,
+    `projects:`, a minted `iri:`) are dropped, not staged as
+    `<stem>-from-<origin>.md`. Whole-file sha256 is a fast path only.
     """
     if sha256_file(incoming_path) == sha256_file(existing_path):
+        return {
+            "stem": incoming_path.stem,
+            "kind": "identical",
+            "incoming_path": incoming_path,
+            "existing_path": existing_path,
+            "similarity": 1.0,
+        }
+    # Body-only: the shard-rejoin smoke case. Parallel curation bumps
+    # frontmatter on pages it never rewrote; those must not land in live
+    # wiki/ as review copies.
+    if body_sha256(incoming_path) == body_sha256(existing_path):
         return {
             "stem": incoming_path.stem,
             "kind": "identical",

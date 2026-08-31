@@ -11,10 +11,14 @@ Three commands:
     merge.py --apply <origin>
         Atomic swap from staging into live wiki/ and vault/. Writes the
         merge manifest at .curator/merges/<origin>.json (used by
-        unmerge). Rebuilds the kuzu graph.
+        unmerge). Rebuilds the kuzu graph unless --no-rebuild.
+
+    merge.py --apply-queue
+        Apply every origin in .curator/merge-queue.json FIFO, then
+        rebuild the graph once.
 
     merge.py --abandon <origin>
-        Discard the staging directory.
+        Discard the staging directory and drop the origin from the queue.
 
 The pipeline applies trust defenses (T1–T8 in docs/trust-model.md) and
 optional security/quality gates (--enable-snyk-code / --enable-semgrep /
@@ -109,6 +113,35 @@ def _build_parser() -> argparse.ArgumentParser:
                          "(the shard's exported wiki tree) and --as-origin.")
     ap.add_argument("--workspace", default=".",
                     help="receiving workspace root (default: cwd)")
+    ap.add_argument("--iri-required", action="store_true",
+                    help="refuse to stage (exit 1, staging left for the "
+                         "audit) when any page falls through to stem "
+                         "matching. Stem fallback always warns on stderr; "
+                         "this flag makes it a hard gate.")
+    ap.add_argument("--acl", choices=("keep-receiver", "union", "intersect"),
+                    default="keep-receiver",
+                    help="how `projects:` tags combine when two pages become "
+                         "one (identity collapse or identical-body drop). "
+                         "keep-receiver (default): never mutate the survivor. "
+                         "union: add incoming tags. intersect: receiver ∩ "
+                         "incoming, but only on type: analysis pages "
+                         "(other types stay keep-receiver). New pages with "
+                         "no collision keep their incoming tags either way.")
+    ap.add_argument("--allow-iris", metavar="FILE", default=None,
+                    help="path to an allow-list (one IRI per line, # comments "
+                         "ok). Listed IRIs may land on / collapse into the "
+                         "receiver's canonical slugs. Unlisted IRIs never "
+                         "occupy a trunk slug: they are origin-namespaced "
+                         "as <stem>-from-<origin>.md. Omit the flag for no "
+                         "gating (every IRI is allowed).")
+    ap.add_argument("--apply-queue", action="store_true",
+                    help="apply every origin in `.curator/merge-queue.json` "
+                         "FIFO, then rebuild the graph once. Staging each "
+                         "shard still uses --as-origin <name> as usual.")
+    ap.add_argument("--no-rebuild", action="store_true",
+                    help="skip graph.py rebuild after --apply (used by "
+                         "--apply-queue; also useful when applying several "
+                         "origins by hand before one rebuild).")
 
     # Optional security/quality gates.
     ap.add_argument("--enable-snyk-code", action="store_true")
@@ -185,6 +218,116 @@ def _ensure_staging(workspace: Path, origin: str) -> dict:
         "apply_json": root / "apply.json",
     }
     return paths
+
+
+# --- merge queue (FIFO origins) -------------------------------------------
+
+
+def _queue_path(workspace: Path) -> Path:
+    return workspace / ".curator" / "merge-queue.json"
+
+
+def _queue_load(workspace: Path) -> dict:
+    p = _queue_path(workspace)
+    if not p.is_file():
+        return {"origins": []}
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {"origins": []}
+    origins = data.get("origins") if isinstance(data, dict) else None
+    if not isinstance(origins, list):
+        origins = []
+    return {"origins": [o for o in origins if isinstance(o, str)]}
+
+
+def _queue_save(workspace: Path, queue: dict) -> None:
+    p = _queue_path(workspace)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(queue, indent=2, sort_keys=True) + "\n")
+
+
+def _queue_append(workspace: Path, origin: str) -> None:
+    q = _queue_load(workspace)
+    if origin not in q["origins"]:
+        q["origins"].append(origin)
+        _queue_save(workspace, q)
+
+
+def _queue_remove(workspace: Path, origin: str) -> None:
+    q = _queue_load(workspace)
+    if origin in q["origins"]:
+        q["origins"] = [o for o in q["origins"] if o != origin]
+        _queue_save(workspace, q)
+
+
+def _rebuild_graph(workspace: Path) -> None:
+    graph_py = Path(_ce_scripts or "") / "graph.py" if _ce_scripts else None
+    if graph_py and graph_py.is_file():
+        subprocess.run(
+            ["uv", "run", "python3", str(graph_py), "rebuild", "wiki"],
+            cwd=str(workspace), check=False,
+        )
+
+
+# --- projects ACL + allow-iris --------------------------------------------
+
+
+def _projects_list(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        s = value.strip()
+        if s.startswith("[") and s.endswith("]"):
+            s = s[1:-1]
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return []
+
+
+def _format_projects(projects: list[str]) -> str:
+    return "[" + ", ".join(sorted(dict.fromkeys(projects))) + "]"
+
+
+def _load_allow_iris(path_arg: str) -> set[str]:
+    if ".." in Path(path_arg).parts:
+        raise SystemExit(f"refusing allow-iris path with .. segments: {path_arg!r}")
+    p = Path(path_arg).expanduser()
+    if not p.is_file():
+        raise SystemExit(f"allow-iris file not found: {p}")
+    out: set[str] = set()
+    for line in p.read_text(errors="replace").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.add(s)
+    return out
+
+
+def _apply_acl_projects(page: Path, incoming_projects: list[str], *,
+                        acl: str, incoming_type: str | None) -> None:
+    """Mutate survivor `projects:` per --acl. keep-receiver is a no-op."""
+    if acl == "keep-receiver" or not incoming_projects:
+        return
+    if not page.is_file():
+        return
+    text = page.read_text(errors="replace")
+    fm, _ = read_frontmatter(text)
+    recv = _projects_list(fm.get("projects"))
+    recv_type = (fm.get("type") or incoming_type or "").strip()
+    inc_type = (incoming_type or "").strip()
+    if acl == "intersect":
+        if recv_type != "analysis" and inc_type != "analysis":
+            return
+        new = sorted(set(recv) & set(incoming_projects))
+    else:  # union
+        new = sorted(set(recv) | set(incoming_projects))
+    if new == sorted(set(recv)):
+        return
+    updated = set_frontmatter_field(text, "projects", _format_projects(new))
+    if updated != text:
+        page.write_text(updated)
 
 
 # --- frontmatter and body transforms (trust model T1, T2) ----------------
@@ -515,11 +658,29 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
                                        "different_topic": []}
     for c in page_collisions:
         by_kind.setdefault(c["kind"], []).append(c)
-    L.append(f"- identical (kept one): {len(by_kind['identical'])}")
+    L.append(f"- identical (kept one; not copied to wiki/): "
+             f"{len(by_kind['identical'])}")
     L.append(f"- same topic (preserved both, manual review): "
              f"{len(by_kind['same_topic'])}")
     L.append(f"- different topic (incoming renamed): "
              f"{len(by_kind['different_topic'])}")
+    stem_fb = manifest.get("stem_fallbacks") or []
+    if stem_fb:
+        L.append("")
+        L.append("### Stem fallback (un-minted)")
+        L.append("")
+        L.append(
+            f"{len(stem_fb)} page(s) had no IRI/`same_as` match and "
+            "fell through to stem matching. Prod federation should mint "
+            "IRIs (`identifier_cache.py mint-entity`) so this path stays "
+            "empty. `--iri-required` refuses the stage when this list "
+            "is non-empty."
+        )
+        L.append("")
+        for fb in stem_fb[:50]:
+            L.append(f"- `{fb.get('rel')}` ({fb.get('kind')})")
+        if len(stem_fb) > 50:
+            L.append(f"- ... and {len(stem_fb) - 50} more")
     if by_kind["same_topic"]:
         L.append("")
         L.append("### Same topic — manual review queue")
@@ -562,6 +723,9 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
                         if r.get("incoming_slug") != r.get("canonical_slug")]
         L.append(f"- slugs collapsed (different slug → canonical): "
                  f"{len(slug_changes)}")
+        identical_id = [r for r in recs if r.get("bodies_identical")]
+        L.append(f"- identical body (no review copy in wiki/): "
+                 f"{len(identical_id)}")
         if is_shard:
             L.append(f"- seam joins (parent already held the IRI): {len(seams)}")
         L.append("")
@@ -584,10 +748,15 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
             L.append("### Slugs collapsed")
             L.append("")
             for r in slug_changes[:50]:
+                review = r.get("review_copy_rel")
+                if r.get("bodies_identical") or not review:
+                    extra = "bodies identical — no review copy"
+                else:
+                    extra = (f"wikilinks redirected; incoming body preserved "
+                             f"for review at collisions/{review}")
                 L.append(
                     f"- `{r.get('incoming_slug')}` → `{r.get('canonical_slug')}` "
-                    f"(wikilinks redirected; incoming body preserved for "
-                    f"review at collisions/{r.get('review_copy_rel')})")
+                    f"({extra})")
             L.append("")
         if is_shard and seams:
             L.append("### Seam joins")
@@ -707,6 +876,17 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
              f"{len([v for v in manifest['vault_files'] if not v.get('deduped')])}")
     L.append(f"- vault files deduped: "
              f"{len([v for v in manifest['vault_files'] if v.get('deduped')])}")
+    drops = manifest.get("identical_body_drops") or []
+    if drops:
+        L.append(f"- identical-body drops (not copied to wiki/): {len(drops)}")
+    acl = manifest.get("acl") or "keep-receiver"
+    L.append(f"- ACL policy: `{acl}`")
+    if manifest.get("allow_iris") is not None:
+        L.append(f"- allow-iris: {len(manifest['allow_iris'])} IRI(s)")
+    if drops and acl == "keep-receiver":
+        L.append("")
+        L.append("Incoming `projects:` on dropped/collapsed pages were "
+                 "not applied (keep-receiver). `--acl union` to add them.")
     L.append("")
 
     staging["audit"].write_text("\n".join(L) + "\n")
@@ -724,6 +904,12 @@ def cmd_stage(args) -> int:
 
     if not (workspace / "wiki").is_dir() or not (workspace / "vault").is_dir():
         raise SystemExit(f"receiving workspace missing wiki/ or vault/: {workspace}")
+
+    # Validate --allow-iris before creating staging so a missing file
+    # doesn't leave a leftover directory that blocks re-stage.
+    allow_iris: set[str] | None = (
+        _load_allow_iris(args.allow_iris) if args.allow_iris else None
+    )
 
     # Shard ingestion (U4): when --import-shard is given, read the shard
     # export to learn its seam IRIs — the entity pages inside the shard that
@@ -870,20 +1056,60 @@ def cmd_stage(args) -> int:
         src_wiki, receiver_identity,
         incoming_db_path=incoming_db if incoming_db.is_file() else None,
     )
+
+    # --allow-iris: unlisted IRIs never occupy a trunk slug (laptop → org).
+    # They are origin-namespaced and skipped for identity collapse so they
+    # cannot union same_as into a canonical org entity.
+    force_namespace: set[str] = set()
+    if allow_iris is not None:
+        kept: list[dict] = []
+        for r in reconciliations:
+            iri = r.get("canonical_iri") or r.get("incoming_iri")
+            if iri and iri not in allow_iris:
+                force_namespace.add(r["incoming_rel"])
+                sys.stderr.write(
+                    f"merge: allow-iris — namespacing unlisted IRI "
+                    f"{iri} ({r['incoming_rel']})\n"
+                )
+            else:
+                kept.append(r)
+        reconciliations = kept
+        for inc in identity.load_page_entities(src_wiki):
+            iri = inc.get("iri")
+            if iri and iri not in allow_iris:
+                force_namespace.add(inc["rel"])
+
     # incoming_rel → reconciliation record (collapsed, not a live page).
     identity_collapse: dict[str, dict] = {}
     # incoming_slug → canonical_slug, for wikilink redirection (differing
     # slugs only; same-slug collapses need no link rewrite).
     slug_redirect: dict[str, str] = {}
+    receiver_wiki = workspace / "wiki"
     for r in reconciliations:
         r["is_seam"] = bool(
             (r.get("canonical_iri") in shard_seam_iris)
             or (r.get("incoming_iri") in shard_seam_iris)
         )
-        # Where the collapsed body is preserved for review: alongside the
-        # canonical page as <canonical-stem>-from-<origin>.md.
+        inc_path = src_wiki / r["incoming_rel"]
+        inc_fm, _ = read_frontmatter(
+            inc_path.read_text(errors="replace") if inc_path.is_file() else ""
+        )
+        r["incoming_projects"] = _projects_list(inc_fm.get("projects"))
+        r["incoming_type"] = inc_fm.get("type") or ""
         canon_rel = r.get("canonical_rel") or r["incoming_rel"]
-        r["review_copy_rel"] = reconcile.collision_target_rel(canon_rel, origin)
+        canon_path = receiver_wiki / canon_rel if r.get("canonical_rel") else None
+        bodies_identical = bool(
+            inc_path.is_file() and canon_path is not None
+            and canon_path.is_file()
+            and reconcile.body_sha256(inc_path) == reconcile.body_sha256(canon_path)
+        )
+        r["bodies_identical"] = bodies_identical
+        # Review copy only when the incoming body actually differs. Identical
+        # bodies must not materialize as <stem>-from-<origin>.md in live wiki/.
+        r["review_copy_rel"] = (
+            None if bodies_identical
+            else reconcile.collision_target_rel(canon_rel, origin)
+        )
         identity_collapse[r["incoming_rel"]] = r
         inc_slug, canon_slug = r.get("incoming_slug"), r.get("canonical_slug")
         if inc_slug and canon_slug and inc_slug != canon_slug:
@@ -908,25 +1134,55 @@ def cmd_stage(args) -> int:
                 f"__same_topic__:{reconcile.collision_target_rel(rel, origin)}"
             )
 
+    stem_fallbacks = [
+        {"rel": str(c["incoming_path"].relative_to(src_wiki)),
+         "kind": c["kind"], "stem": c["stem"]}
+        for c in collisions
+    ]
+    for fb in stem_fallbacks:
+        sys.stderr.write(
+            f"merge: stem fallback (no IRI): {fb['rel']} ({fb['kind']})\n"
+        )
+
     # 4. Walk every incoming wiki page; transform; write to staging.
     manifest_pages: list[dict] = []
+    identical_body_drops: list[dict] = []
     for p in src_wiki.rglob("*.md"):
         rel = str(p.relative_to(src_wiki))
         if any(seg.startswith(".") for seg in rel.split(os.sep)):
             continue
         collapsed = identity_collapse.get(rel)
+        drop_identical = False
         if collapsed is not None:
-            # Identity-reconciled entity: never a live page (the receiver's
-            # canonical page wins). Preserve the framed body under
-            # collisions/ for review so incoming knowledge isn't lost and the
-            # receiver isn't overwritten.
-            target_rel = collapsed["review_copy_rel"]
-            staged_under = staging["collisions"]
+            if collapsed.get("bodies_identical") or not collapsed.get("review_copy_rel"):
+                identical_body_drops.append({
+                    "incoming_rel": rel,
+                    "existing_rel": collapsed.get("canonical_rel") or rel,
+                    "incoming_projects": collapsed.get("incoming_projects") or [],
+                    "incoming_type": collapsed.get("incoming_type") or "",
+                    "kind": "identity",
+                })
+                drop_identical = True
+            else:
+                target_rel = collapsed["review_copy_rel"]
+                staged_under = staging["collisions"]
+        elif rel in force_namespace:
+            # Unlisted IRI: origin-namespace even when the trunk slug is free.
+            target_rel = reconcile.collision_target_rel(rel, origin)
+            staged_under = staging["wiki_in"]
         elif rel in collision_targets:
             disp = collision_targets[rel]
             if disp == "__drop__":
-                continue
-            if disp.startswith("__same_topic__:"):
+                inc_fm, _ = read_frontmatter(p.read_text(errors="replace"))
+                identical_body_drops.append({
+                    "incoming_rel": rel,
+                    "existing_rel": rel,
+                    "incoming_projects": _projects_list(inc_fm.get("projects")),
+                    "incoming_type": inc_fm.get("type") or "",
+                    "kind": "stem",
+                })
+                drop_identical = True
+            elif disp.startswith("__same_topic__:"):
                 target_rel = disp.split(":", 1)[1]
                 staged_under = staging["collisions"]
             else:
@@ -936,12 +1192,23 @@ def cmd_stage(args) -> int:
             target_rel = rel
             staged_under = staging["wiki_in"]
 
+        if drop_identical:
+            manifest_pages.append({
+                "incoming_rel": rel,
+                "final_rel": None,
+                "staged_under": "dropped-identical-body",
+                "sha256_at_import": reconcile.sha256_file(p),
+            })
+            continue
+
         text = p.read_text(errors="replace")
         fm, body = _strip_to_allowed_frontmatter(text)
         fm = _apply_origin_and_untrusted(fm, origin)
         body = _rewrite_citations(body, vault_plan["alias_map"])
         # Redirect wikilinks pointing at any identity-collapsed slug to the
         # receiver's canonical slug, so the merged graph rejoins on identity.
+        # Also rewrite links on origin-namespaced (unlisted-IRI) pages so
+        # they don't dangle at a collapsed incoming slug.
         body = _redirect_wikilinks(body, slug_redirect)
         body = _frame_body(body, origin)
         out_text = _format_frontmatter(fm) + body
@@ -1100,6 +1367,11 @@ def cmd_stage(args) -> int:
         "identity_reconciliations": reconciliations,
         "is_shard_import": bool(args.import_shard),
         "shard_warnings": shard_warnings,
+        "acl": args.acl,
+        "allow_iris": (sorted(allow_iris) if allow_iris is not None else None),
+        "stem_fallbacks": stem_fallbacks,
+        "iri_required": bool(args.iri_required),
+        "identical_body_drops": identical_body_drops,
         "preflight_summary": preflight.manifest_summary(preflight_findings),
         "preflight_findings": preflight_findings_safe,
         "incoming_manifest_warnings": incoming_manifest_warnings,
@@ -1118,7 +1390,97 @@ def cmd_stage(args) -> int:
         f"to apply: merge.py --apply {origin}\n"
         f"to discard: merge.py --abandon {origin}\n"
     )
+    if args.iri_required and stem_fallbacks:
+        sys.stderr.write(
+            f"merge: --iri-required: {len(stem_fallbacks)} page(s) fell "
+            "through to stem matching. Staging is left for the audit; "
+            "run --abandon or mint IRIs and re-stage.\n"
+        )
+        return 1
+    _queue_append(workspace, origin)
     return 0
+
+
+def _copy_wiki_avoiding_clobber(src: Path, dest: Path, origin: str,
+                                receiver_wiki: Path) -> str:
+    """Copy a staged wiki page without overwriting a different live page.
+
+    Identical unframed bodies → skip. Dest taken → rename to
+    `<stem>-from-<origin>.md`. Already-namespaced dest with a different
+    body is left in place (never clobber).
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        shutil.copy2(src, dest)
+        return "copied"
+    if reconcile.body_sha256(src) == reconcile.body_sha256(dest):
+        return "skipped"
+    alt_rel = reconcile.collision_target_rel(
+        str(dest.relative_to(receiver_wiki)), origin)
+    alt = receiver_wiki / alt_rel
+    if alt == dest:
+        sys.stderr.write(
+            f"merge: apply — dest exists, not overwriting {dest}\n")
+        return "skipped"
+    if alt.exists():
+        if reconcile.body_sha256(src) == reconcile.body_sha256(alt):
+            return "skipped"
+        sys.stderr.write(
+            f"merge: apply — dest exists, not overwriting {alt}\n")
+        return "skipped"
+    alt.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, alt)
+    return "renamed"
+
+
+def _copy_vault_avoiding_clobber(src: Path, dest: Path, origin: str) -> str:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not dest.exists():
+        shutil.copy2(src, dest)
+        return "copied"
+    if reconcile.sha256_file(src) == reconcile.sha256_file(dest):
+        return "skipped"
+    stem, ext = os.path.splitext(dest.name)
+    alt = dest.with_name(f"{stem}.from-{origin}{ext}")
+    if alt == dest or alt.exists():
+        if alt.exists() and reconcile.sha256_file(src) == reconcile.sha256_file(alt):
+            return "skipped"
+        sys.stderr.write(
+            f"merge: apply — vault dest exists, not overwriting {dest}\n")
+        return "skipped"
+    shutil.copy2(src, alt)
+    return "renamed"
+
+
+def _union_identity_into_receiver(
+        receiver_wiki: Path, receiver_db: Path, *,
+        canon_rel: str | None, canon_iri: str | None,
+        entity_class: str, union: dict,
+        incoming_projects: list[str], incoming_type: str,
+        acl: str) -> None:
+    if canon_rel:
+        page = receiver_wiki / canon_rel
+        if page.is_file():
+            text = page.read_text(errors="replace")
+            cur_fm, _ = read_frontmatter(text)
+            merged = identity.union_same_as(
+                identity.parse_same_as(cur_fm.get("same_as")), union)
+            if merged:
+                updated = set_frontmatter_field(
+                    text, "same_as", identity.format_same_as_list(merged))
+                if updated != text:
+                    page.write_text(updated)
+            _apply_acl_projects(
+                page, incoming_projects, acl=acl, incoming_type=incoming_type)
+    if canon_iri:
+        try:
+            identity.upsert_entity_union(
+                receiver_db, canon_iri, entity_class=entity_class,
+                page_path=canon_rel, same_as=union)
+        except sqlite3.DatabaseError as e:
+            sys.stderr.write(
+                f"merge: could not update identity registry for "
+                f"{canon_iri}: {e}\n")
 
 
 def cmd_apply(args) -> int:
@@ -1128,6 +1490,12 @@ def cmd_apply(args) -> int:
     if not staging["apply_json"].is_file():
         raise SystemExit(f"no staging at {staging['root']}; nothing to apply")
     manifest = json.loads(staging["apply_json"].read_text())
+
+    if manifest.get("iri_required") and manifest.get("stem_fallbacks"):
+        raise SystemExit(
+            "refusing to apply: staged with --iri-required and stem "
+            "fallbacks. Mint IRIs and re-stage, or --abandon."
+        )
 
     # Refuse if anything in _suspect/ — user must explicitly resolve.
     if staging["suspect"].is_dir():
@@ -1141,62 +1509,95 @@ def cmd_apply(args) -> int:
 
     receiver_wiki = workspace / "wiki"
     receiver_vault = workspace / "vault"
-
-    # Move pages.
-    moves: list[tuple[Path, Path]] = []
-    for p in staging["wiki_in"].rglob("*.md"):
-        rel = p.relative_to(staging["wiki_in"])
-        moves.append((p, receiver_wiki / rel))
-    # Same-topic collision pages: copy alongside in receiver under <stem>-from-<origin>.md.
-    for p in staging["collisions"].rglob("*.md"):
-        rel = p.relative_to(staging["collisions"])
-        moves.append((p, receiver_wiki / rel))
-    # Vault new files.
-    for p in staging["vault_in"].rglob("*"):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(staging["vault_in"])
-        moves.append((p, receiver_vault / rel))
-
-    for src, dst in moves:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dst)
-
-    # Apply identity reconciliations (U1): union each incoming entity's
-    # same_as into the receiver's canonical page frontmatter AND the
-    # `entities` registry. Done here (not at stage time) so staging stays
-    # non-mutating — consistent with the rest of the apply step.
     receiver_db = workspace / ".curator" / "identifiers.db"
+    acl = manifest.get("acl") or "keep-receiver"
+    allow_iris = manifest.get("allow_iris")  # None → no gating
+    allow_set = set(allow_iris) if isinstance(allow_iris, list) else None
+
+    receiver_identity = identity.build_receiver_index(receiver_wiki, receiver_db)
+
+    # Wiki-incoming: dest-guard + identity re-match (queue FIFO: a prior
+    # origin may have landed an entity this shard also carries).
+    if staging["wiki_in"].is_dir():
+        for p in staging["wiki_in"].rglob("*.md"):
+            rel = str(p.relative_to(staging["wiki_in"]))
+            fm, _ = read_frontmatter(p.read_text(errors="replace"))
+            iri = (fm.get("iri") or "").strip() if isinstance(fm.get("iri"), str) \
+                else (fm.get("iri") or "")
+            iri = iri or None
+            gated_out = bool(allow_set is not None and iri and iri not in allow_set)
+            match = None
+            if not gated_out:
+                if iri and iri in receiver_identity["by_iri"]:
+                    match = receiver_identity["by_iri"][iri]
+                if match is None:
+                    for k, v in identity.parse_same_as(fm.get("same_as")).items():
+                        rec = receiver_identity["by_pair"].get(f"{k}:{v}")
+                        if rec:
+                            match = rec
+                            break
+            if match and match.get("rel"):
+                canon = receiver_wiki / match["rel"]
+                union = identity.union_same_as(
+                    match.get("same_as"), identity.parse_same_as(fm.get("same_as")))
+                _union_identity_into_receiver(
+                    receiver_wiki, receiver_db,
+                    canon_rel=match.get("rel"),
+                    canon_iri=match.get("iri"),
+                    entity_class=match.get("entity_class") or "concept",
+                    union=union,
+                    incoming_projects=_projects_list(fm.get("projects")),
+                    incoming_type=fm.get("type") or "",
+                    acl=acl,
+                )
+                if canon.is_file() and reconcile.body_sha256(p) == reconcile.body_sha256(canon):
+                    continue
+                review = receiver_wiki / reconcile.collision_target_rel(
+                    match["rel"], origin)
+                _copy_wiki_avoiding_clobber(p, review, origin, receiver_wiki)
+                continue
+            dest = receiver_wiki / rel
+            _copy_wiki_avoiding_clobber(p, dest, origin, receiver_wiki)
+
+    # Same-topic / identity review copies. Dest is already <stem>-from-<origin>.
+    if staging["collisions"].is_dir():
+        for p in staging["collisions"].rglob("*.md"):
+            rel = str(p.relative_to(staging["collisions"]))
+            dest = receiver_wiki / rel
+            _copy_wiki_avoiding_clobber(p, dest, origin, receiver_wiki)
+
+    if staging["vault_in"].is_dir():
+        for p in staging["vault_in"].rglob("*"):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(staging["vault_in"])
+            dest = receiver_vault / rel
+            _copy_vault_avoiding_clobber(p, dest, origin)
+
+    # Staged identity reconciliations (U1): union same_as (+ ACL projects).
     id_recs = manifest.get("identity_reconciliations", [])
     for r in id_recs:
-        union = r.get("union_same_as") or {}
-        canon_rel = r.get("canonical_rel")
-        canon_iri = r.get("canonical_iri")
-        entity_class = r.get("entity_class") or "concept"
-        # 1) Canonical page frontmatter: re-union with whatever it currently
-        # carries (it may have changed since staging) and rewrite same_as.
-        if canon_rel:
-            page = receiver_wiki / canon_rel
-            if page.is_file():
-                text = page.read_text(errors="replace")
-                cur_fm, _ = read_frontmatter(text)
-                merged = identity.union_same_as(
-                    identity.parse_same_as(cur_fm.get("same_as")), union)
-                if merged:
-                    updated = set_frontmatter_field(
-                        text, "same_as", identity.format_same_as_list(merged))
-                    if updated != text:
-                        page.write_text(updated)
-        # 2) IRI registry: union into the receiver's entities table.
-        if canon_iri:
-            try:
-                identity.upsert_entity_union(
-                    receiver_db, canon_iri, entity_class=entity_class,
-                    page_path=canon_rel, same_as=union)
-            except sqlite3.DatabaseError as e:
-                sys.stderr.write(
-                    f"merge: could not update identity registry for "
-                    f"{canon_iri}: {e}\n")
+        _union_identity_into_receiver(
+            receiver_wiki, receiver_db,
+            canon_rel=r.get("canonical_rel"),
+            canon_iri=r.get("canonical_iri"),
+            entity_class=r.get("entity_class") or "concept",
+            union=r.get("union_same_as") or {},
+            incoming_projects=r.get("incoming_projects") or [],
+            incoming_type=r.get("incoming_type") or "",
+            acl=acl,
+        )
+
+    # Identical-body stem drops: ACL may still union/intersect projects onto
+    # the surviving receiver page. keep-receiver is a no-op.
+    for drop in manifest.get("identical_body_drops") or []:
+        existing = drop.get("existing_rel")
+        if not existing:
+            continue
+        page = receiver_wiki / existing
+        _apply_acl_projects(
+            page, drop.get("incoming_projects") or [],
+            acl=acl, incoming_type=drop.get("incoming_type") or "")
 
     # Persist manifest at .curator/merges/<origin>.json (used by unmerge).
     merges_dir = workspace / ".curator" / "merges"
@@ -1208,21 +1609,41 @@ def cmd_apply(args) -> int:
         json.dumps(manifest, indent=2, sort_keys=True) + "\n"
     )
 
-    # Rebuild graph if curiosity-engine's graph.py is reachable.
-    graph_py = Path(_ce_scripts or "") / "graph.py" if _ce_scripts else None
-    if graph_py and graph_py.is_file():
-        subprocess.run(
-            ["uv", "run", "python3", str(graph_py), "rebuild", "wiki"],
-            cwd=str(workspace), check=False,
-        )
+    if not getattr(args, "no_rebuild", False):
+        _rebuild_graph(workspace)
 
-    # Discard staging.
     shutil.rmtree(staging["root"])
+    _queue_remove(workspace, origin)
     sys.stdout.write(
         f"merge applied: {len(manifest['wiki_pages'])} pages, "
         f"{len(manifest['vault_files'])} vault entries\n"
         f"manifest: {merges_dir / (origin + '.json')}\n"
     )
+    return 0
+
+
+def cmd_apply_queue(args) -> int:
+    workspace = Path(args.workspace).resolve()
+    origins = list(_queue_load(workspace)["origins"])
+    if not origins:
+        raise SystemExit("merge queue is empty")
+    for origin in origins:
+        ns = argparse.Namespace(
+            apply=origin, workspace=str(workspace), no_rebuild=True)
+        rc = cmd_apply(ns)
+        if rc != 0:
+            return rc
+    if not getattr(args, "no_rebuild", False):
+        _rebuild_graph(workspace)
+        sys.stdout.write(
+            f"merge queue applied: {len(origins)} origin(s), "
+            "graph rebuilt once\n"
+        )
+    else:
+        sys.stdout.write(
+            f"merge queue applied: {len(origins)} origin(s), "
+            "graph rebuild skipped (--no-rebuild)\n"
+        )
     return 0
 
 
@@ -1318,14 +1739,18 @@ def cmd_abandon(args) -> int:
     staging = _ensure_staging(workspace, origin)
     if not staging["root"].exists():
         sys.stdout.write(f"nothing to abandon: {staging['root']}\n")
+        _queue_remove(workspace, origin)
         return 0
     shutil.rmtree(staging["root"])
+    _queue_remove(workspace, origin)
     sys.stdout.write(f"abandoned: {staging['root']}\n")
     return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
+    if args.apply_queue:
+        return cmd_apply_queue(args)
     if args.apply:
         return cmd_apply(args)
     if args.abandon:

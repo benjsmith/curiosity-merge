@@ -85,21 +85,25 @@ Reuses curiosity-engine's embedding stack (sentence-transformers + sqlite-vec, b
 ```
 uv run python3 <skill_path>/scripts/merge.py \
     <other-wiki-path> --as-origin <name>
+uv run python3 <skill_path>/scripts/merge.py \
+    --import-shard <export.json> <shard-wiki> --as-origin <name>
+uv run python3 <skill_path>/scripts/merge.py --apply-queue
 ```
 
 Combines `<other-wiki-path>` into the current workspace's wiki. The pipeline:
 
-1. **Vault sha256 reconciliation** — identical content under different filenames is deduplicated; same filename, different content is renamed with an origin discriminator.
+1. **Vault sha256 reconciliation** — identical content under different filenames is deduplicated; same filename, different content is renamed with an origin discriminator. Do not change this path: shard rejoins routinely dedupe the whole vault (measured: 0 new / tens of thousands deduped per apply).
 2. **Source-stub stem reconciliation** — stubs pointing at the same vault file are collapsed; stubs are re-stemmed via curiosity-engine's `naming.citation_stem`.
-3. **Identity reconciliation (IRI-keyed, U1)** — runs *before* stem collisions. Entity pages carrying a curiosity-engine `iri:` (or a `same_as:` map) are matched across the two wikis by shared `iri` first, then by any overlapping `authority:id` pair — read from the receiver's `.curator/identifiers.db` `entities` table and from page frontmatter. A matched entity collapses into the receiver's canonical page **regardless of slug**: it is not re-staged as a live page (its framed body is preserved under `collisions/` for review), wikilinks to its slug are redirected to the canonical slug, and its `same_as` map is unioned into the receiver's page frontmatter and `entities` registry on apply. Pages with no minted IRI fall through to the stem queue (step 4) exactly as before — identity reconciliation is purely additive, so a wiki with no IRIs merges byte-for-byte as it always did.
-4. **Page-name collision queue (stem fallback)** — pages with the same stem are NEVER silently overwritten. Identical content drops one; same topic / both substantive go to a manual-reconciliation queue with both versions preserved as `<stem>.md` and `<stem>-from-<origin>.md`; different topics that happen to share a stem are renamed with an origin discriminator.
+3. **Identity reconciliation (IRI-keyed, U1)** — runs *before* stem collisions. Entity pages carrying a curiosity-engine `iri:` (or a `same_as:` map) are matched across the two wikis by shared `iri` first, then by any overlapping `authority:id` pair — read from the receiver's `.curator/identifiers.db` `entities` table and from page frontmatter. A matched entity collapses into the receiver's canonical page **regardless of slug**: it is not re-staged as a live page, wikilinks to its slug are redirected to the canonical slug, and its `same_as` map is unioned into the receiver's page frontmatter and `entities` registry on apply. If the incoming **body** (frontmatter-stripped, merge-framing ignored) is identical to the canonical page, no `<stem>-from-<origin>.md` review copy is written into live `wiki/` — only `same_as` is unioned. Different bodies still land a review copy under `collisions/` for human review. Pages with no minted IRI fall through to the stem queue (step 4).
+4. **Page-name collision queue (stem fallback)** — pages with the same stem are NEVER silently overwritten. **Identical bodies** (not whole-file sha256 — frontmatter may differ after parallel shard curation) drop the incoming page; it is not materialized as `<stem>-from-<origin>.md`. Same topic / both substantive go to a manual-reconciliation queue with both versions preserved as `<stem>.md` and `<stem>-from-<origin>.md`; different topics that happen to share a stem are renamed with an origin discriminator. Every stem fallback prints `merge: stem fallback (no IRI): …` on stderr and is listed in the audit; `--iri-required` refuses the stage (exit 1, staging left for the audit) when this list is non-empty.
 5. **Origin tagging** — every page from the other wiki gains an `origin: <name>` audit field in addition to its existing `projects:` set.
-6. **Untrusted framing** — every merged page body is wrapped in `<!-- BEGIN UNTRUSTED MERGED CONTENT — origin:<name> -->` framing and gets `untrusted: true` in frontmatter so future curator workers treat the content as data, not instructions.
-7. **Graph union** — the kuzu graph is rebuilt across the merged wiki via curiosity-engine's `graph.py rebuild wiki`.
-8. **Cross-origin bridge discovery** — `discover-bridges --across-origins` runs and writes its review queue.
-9. **Audit report** — `.curator/merge-<timestamp>.md` summarizes every reconciliation, every collision, and every bridge candidate. Identity reconciliations (which IRIs matched, which slugs collapsed, which were shard seam joins) are reported under a distinct `## Identity reconciliation` section, separate from the stem-based `## Page-name collisions`. The user reviews this before any commit lands.
+6. **`projects:` ACL** — `--acl keep-receiver` (default): when two pages become one, the survivor's `projects:` is unchanged (incoming tags are logged, not applied). `--acl union` adds incoming tags. `--acl intersect` sets survivor = receiver ∩ incoming, but only on `type: analysis` pages (other types stay keep-receiver). New pages with no collision keep their incoming tags either way.
+7. **`--allow-iris FILE`** — laptop → org trunk. One IRI per line (`#` comments ok). Listed IRIs may collapse onto / land at canonical trunk slugs. Unlisted IRIs never occupy a trunk slug: they are origin-namespaced as `<stem>-from-<origin>.md` and do not union `same_as` into a trunk entity. Omit the flag for no gating.
+8. **Untrusted framing** — every merged page body is wrapped in `<!-- BEGIN UNTRUSTED MERGED CONTENT — origin:<name> -->` framing and gets `untrusted: true` in frontmatter so future curator workers treat the content as data, not instructions.
+9. **Graph union** — the kuzu graph is rebuilt across the merged wiki via curiosity-engine's `graph.py rebuild wiki`. `--no-rebuild` skips it. Successful stages append the origin to `.curator/merge-queue.json`; `merge.py --apply-queue` applies every queued origin FIFO with dest-clobber guards (identical body → skip; dest taken → rename) and rebuilds the graph **once**.
+10. **Audit report** — `.curator/.merge-staging/<origin>/audit-report.md` summarizes every reconciliation, every collision, every identical-body drop, and every stem fallback. Identity reconciliations are under `## Identity reconciliation`, separate from the stem-based `## Page-name collisions`. The user reviews this before any commit lands.
 
-All work is staged in `.curator/.merge-staging/<origin>/` first. The atomic swap into `wiki/` and `vault/` only happens after the user reviews the audit report and explicitly approves. The receiving wiki's `.git` is untouched until the user runs their own `git -C wiki commit`.
+All work is staged in `.curator/.merge-staging/<origin>/` first. The atomic swap into `wiki/` and `vault/` only happens after the user reviews the audit report and explicitly approves (`--apply <origin>` or `--apply-queue`). The receiving wiki's `.git` is untouched until the user runs their own `git -C wiki commit`.
 
 #### `merge --import-shard` — rejoin a U4 shard on its seam IRIs
 
@@ -108,7 +112,7 @@ uv run python3 <skill_path>/scripts/merge.py \
     --import-shard <export.json> <shard-wiki-path> --as-origin <name>
 ```
 
-Ingests a bounded sub-wiki **shard** — the output of curiosity-engine's `epoch_summary.py --shard <seed-page>` (the `export.json`) plus the shard's exported wiki tree (`<shard-wiki-path>`). The shard's `seam_entities[].iri` are the federation join keys: IRI-bearing entity pages inside the shard that are linked from outside it. Import runs the same identity reconciliation as a plain merge, with the seam IRIs flagged — so a seam entity the parent already holds reconciles into the parent's canonical page (no duplicate) rather than landing as a new page, and the audit's `## Identity reconciliation` section lists those seam joins distinctly. Apply and abandon use the normal `merge.py --apply <name>` / `--abandon <name>` verbs.
+Ingests a bounded sub-wiki **shard** — the output of curiosity-engine's `epoch_summary.py --shard <seed-page>` (the `export.json`) plus the shard's exported wiki tree (`<shard-wiki-path>`). The shard's `seam_entities[].iri` are the federation join keys: IRI-bearing entity pages inside the shard that are linked from outside it. Import runs the same identity reconciliation as a plain merge, with the seam IRIs flagged — so a seam entity the parent already holds reconciles into the parent's canonical page (no duplicate) rather than landing as a new page, and the audit's `## Identity reconciliation` section lists those seam joins distinctly. Identical-body seam pages do not spawn `<stem>-from-<origin>.md` in live `wiki/`. Stage each parallel shard under its own `--as-origin`, then `merge.py --apply-queue` to apply FIFO and rebuild the parent graph once.
 
 ### `unmerge` — undo a previous merge
 
@@ -161,8 +165,8 @@ If alphaxiv isn't installed and an arXiv source needed PDF fallback, the script 
 - **Prompt injection in markdown bodies** aimed at the receiving curator agent. **Defence**: every merged page body is wrapped in `<!-- BEGIN UNTRUSTED MERGED CONTENT — origin:<name> -->` framing and has `untrusted: true` in frontmatter. Workers see the framing and treat content as data.
 - **Manipulated `(vault:...)` citations** pointing at non-existent or wrong-content vault files. **Defence**: every vault file referenced from merged pages must exist in the merged-vault index by sha256; citations to missing or sha-mismatched content get rewritten or flagged in the audit report.
 - **Path traversal in CLI args** (`--to ../../../etc/passwd`). **Defence**: paths containing `..` segments or absolute paths outside the workspace are rejected at argv-parse time.
-- **Page-name collisions on substantive pages** (both wikis have `concepts/transformer.md` with different content). **Defence**: NEVER silently overwrite. Always queue for human review with both versions preserved.
-- **Identity reconciliation respects the same posture** — when an incoming entity matches a receiver identity by `iri`/`same_as`, the receiver's page stays canonical and is never overwritten by untrusted incoming content; the incoming body is preserved under `collisions/` for review, and only the additive `same_as` union is written into the receiver. A spoofed incoming `iri` can at most attach extra `same_as` pairs to an entity the receiver already owns (visible in the audit) — it cannot replace the canonical page or its content.
+- **Page-name collisions on substantive pages** (both wikis have `concepts/transformer.md` with different content). **Defence**: NEVER silently overwrite. Always queue for human review with both versions preserved. Identical **bodies** (frontmatter may differ) drop the incoming page — they do not land as `<stem>-from-<origin>.md` in live `wiki/`.
+- **Identity reconciliation respects the same posture** — when an incoming entity matches a receiver identity by `iri`/`same_as`, the receiver's page stays canonical and is never overwritten by untrusted incoming content. Different incoming bodies are preserved under `collisions/` for review; identical bodies are not copied into live `wiki/`. Only the additive `same_as` union is written into the receiver (`projects:` stays keep-receiver unless `--acl union`). A spoofed incoming `iri` can at most attach extra `same_as` pairs to an entity the receiver already owns (visible in the audit) — it cannot replace the canonical page or its content.
 
 See `docs/trust-model.md` for the full threat list and decision rationale.
 
@@ -203,7 +207,7 @@ See `docs/trust-model.md` for the full gate list, the rationale for opt-in defau
 |---|---|
 | `subgraph-export` | shipped (v0.1) |
 | `discover-bridges` + `accept-bridges` | shipped (v0.1) |
-| `merge` (with vault-missing tagging) | shipped (v0.1, vault-missing v0.2) |
+| `merge` (IRI-keyed, shard import, queue, ACL, allow-iris) | shipped (v0.1, vault-missing v0.2, identity v0.6, federation v0.8) |
 | `unmerge` | shipped (v0.1) |
 | `hydrate-vault` | shipped (v0.2) |
 

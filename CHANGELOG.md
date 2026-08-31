@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.8.0 — 2026-08-31
+
+Federation hardening after an 8-way parallel-shard curate/rejoin.
+
+### Never materialize `*-from-<origin>.md` when bodies are identical
+
+`classify_collision` now keys `identical` on **body** identity (frontmatter-stripped; merge framing ignored), not whole-file sha256. Identity collapse skips the review copy when the incoming body matches the canonical page. `--apply` will not copy those files into live `wiki/`. Parallel shard curation routinely bumps `updated:` / `projects:` on pages it never rewrote; those no longer flood the parent as `stem-from-shardN.md`.
+
+Different-body same-topic collisions and different-body identity matches still land a review copy, as before.
+
+### Stem fallback warns; `--iri-required` refuses
+
+Every stem collision (the un-minted fallback) prints `merge: stem fallback (no IRI): …` on stderr and is listed in the audit. `--iri-required` completes staging so the audit is readable, then exits 1 and refuses `--apply`.
+
+### `--acl keep-receiver|union|intersect`
+
+When two pages become one (identity collapse or identical-body drop), `projects:` on the survivor defaults to **keep-receiver** (enterprise-safe; no extra review copies). `--acl union` adds incoming tags. `--acl intersect` sets survivor = receiver ∩ incoming, but only on `type: analysis` pages. New pages with no collision keep their incoming tags either way.
+
+### Merge queue + one parent rebuild
+
+Successful stages append the origin to `.curator/merge-queue.json`. `merge.py --apply-queue` applies FIFO with dest-clobber guards and rebuilds kuzu **once**. `--no-rebuild` skips the per-`--apply` rebuild for hand-rolled batches.
+
+### `--allow-iris FILE` (laptop → org trunk)
+
+Listed IRIs may collapse onto / land at canonical trunk slugs. Unlisted IRIs are origin-namespaced (`<stem>-from-<origin>.md`) and do not union `same_as` into a trunk entity.
+
+Vault sha256 dedup is unchanged.
+
+184 tests passing (was 172 at v0.7.0).
+
 ## v0.7.0 — 2026-07-05
 
 Three small, standalone upgrades to `subgraph_export.py`, motivated by

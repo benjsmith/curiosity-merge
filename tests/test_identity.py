@@ -308,6 +308,103 @@ def test_import_shard_rejects_missing_export(minted_pair, env_with_ce, tmp_path)
 # --- backward compatibility -----------------------------------------------
 
 
+def test_identical_body_seam_does_not_land_from_origin(
+        minted_pair, env_with_ce, tmp_path):
+    """Point 2: a shard seam whose body matches the parent must not
+    materialize entities/<stem>-from-<origin>.md into live wiki/."""
+    wsa, _ = minted_pair
+    parent = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    # Keep the parent's body; only frontmatter (projects) differs — the
+    # parallel-shard smoke case.
+    body = parent.split("---", 2)[-1]
+    shard = tmp_path / "shard-ident"
+    _scaffold(shard)
+    iri = parent.split("iri: ", 1)[1].split("\n", 1)[0].strip()
+    _write(shard / "wiki" / "entities" / "asa.md",
+           "---\ntitle: ASA\ntype: concept\nentity_class: chemical\n"
+           f"iri: {iri}\nsame_as: [pubchem:CID2244]\nprojects: [s]\n"
+           f"---{body}")
+    _write(shard / "wiki" / "concepts" / "only-in-shard.md",
+           "---\ntitle: Only\ntype: concept\nprojects: [s]\n---\n\nNew.\n")
+    export = tmp_path / "ident-export.json"
+    export.write_text(json.dumps({
+        "seed": "entities/asa.md",
+        "shard_size": 2,
+        "pages": ["entities/asa.md", "concepts/only-in-shard.md"],
+        "iri_entities_in_shard": 1,
+        "seam_entities": [{
+            "page": "entities/asa.md", "iri": iri,
+            "external_linkers": ["concepts/outsider.md"]}],
+    }))
+    run_script("merge.py", "--import-shard", str(export), str(shard),
+               "--as-origin", "shard1", "--workspace", str(wsa),
+               env=env_with_ce)
+    staging = wsa / ".curator" / ".merge-staging" / "shard1"
+    recs = json.loads((staging / "apply.json").read_text())[
+        "identity_reconciliations"]
+    assert recs and recs[0]["bodies_identical"] is True
+    assert recs[0]["review_copy_rel"] is None
+    assert not (staging / "collisions").exists() or not any(
+        (staging / "collisions").rglob("*-from-shard1.md"))
+    run_script("merge.py", "--apply", "shard1",
+               "--workspace", str(wsa), env=env_with_ce)
+    wiki_ents = wsa / "wiki" / "entities"
+    assert (wiki_ents / "aspirin.md").is_file()
+    assert not (wiki_ents / "asa.md").exists()
+    assert not (wiki_ents / "aspirin-from-shard1.md").exists()
+    assert not (wiki_ents / "asa-from-shard1.md").exists()
+    assert (wsa / "wiki" / "concepts" / "only-in-shard.md").is_file()
+
+
+def test_apply_keep_receiver_does_not_add_incoming_projects(
+        minted_pair, env_with_ce):
+    """Point 3 default: identity collapse does not mutate canonical
+    `projects:` (keep-receiver)."""
+    wsa, wsb = minted_pair
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    fm = text.split("---", 2)[1]
+    assert "projects: [pharma]" in fm
+    assert "projects: [chem]" not in fm
+    assert "projects: [chem, pharma]" not in fm
+    assert "projects: [pharma, chem]" not in fm
+
+
+def test_acl_union_adds_incoming_projects(minted_pair, env_with_ce):
+    wsa, wsb = minted_pair
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--acl", "union", "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    fm = (wsa / "wiki" / "entities" / "aspirin.md").read_text().split("---", 2)[1]
+    assert "pharma" in fm
+    assert "chem" in fm
+
+
+def test_allow_iris_namespaces_unlisted(
+        minted_pair, env_with_ce, tmp_path):
+    """Point 5: unlisted first-seen IRIs land as <stem>-from-<origin>.md,
+    never at the trunk slug. Listed matches still collapse."""
+    wsa, wsb = minted_pair
+    parent = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    listed = parent.split("iri: ", 1)[1].split("\n", 1)[0].strip()
+    allow = tmp_path / "allow.txt"
+    allow.write_text(f"# org trunk\n{listed}\n")
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--allow-iris", str(allow), "--workspace", str(wsa),
+               env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    ents = wsa / "wiki" / "entities"
+    assert (ents / "aspirin.md").is_file()
+    assert not (ents / "acetylsalicylic-acid.md").exists()
+    assert not (ents / "ibuprofen.md").exists()
+    assert (ents / "ibuprofen-from-labb.md").is_file()
+
+
 def test_no_iri_merge_records_no_reconciliations(
         wiki_a: Path, wiki_b: Path, env_with_ce):
     """The stock fixtures carry no `iri:` — identity reconciliation must be

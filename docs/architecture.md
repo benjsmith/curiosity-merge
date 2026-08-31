@@ -128,12 +128,13 @@ The receiving workspace's `merge` command reads `_export-manifest.json` if prese
 
 The atomic swap is a separate command (`merge.py --apply <origin>`) that:
 
-1. Verifies the staging directory's sha256 hasn't changed since the report was written
-2. Moves files from staging into the live `wiki/` and `vault/`
-3. Runs `graph.py rebuild wiki`
-4. Logs to `.curator/log.md`
+1. Refuses if `_suspect/` is non-empty, or if the stage was `--iri-required` with stem fallbacks
+2. Copies staging into live `wiki/` and `vault/` with dest-clobber guards (identical unframed body → skip; dest taken → `<stem>-from-<origin>.md`; never overwrite a different body)
+3. Unions `same_as` (and `--acl` `projects:` policy) into canonical identity pages
+4. Runs `graph.py rebuild wiki` unless `--no-rebuild`
+5. Appends/drains `.curator/merge-queue.json`. `merge.py --apply-queue` applies every queued origin FIFO and rebuilds the graph once.
 
-If the user wants to abandon the merge: `merge.py --abandon <origin>` removes the staging directory.
+If the user wants to abandon the merge: `merge.py --abandon <origin>` removes the staging directory and drops the origin from the queue.
 
 ## What this skill explicitly does not do
 

@@ -398,6 +398,121 @@ def test_merge_rejects_invalid_origin(wiki_a: Path, wiki_b: Path, env_with_ce):
     assert res.returncode != 0
 
 
+def test_identical_body_stem_not_in_live_wiki(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """Point 2: same stem, identical body, different frontmatter — drop,
+    do not write concepts/<stem>-from-<origin>.md into wiki/."""
+    src = tmp_path / "wiki-ident"
+    (src / "wiki" / "concepts").mkdir(parents=True)
+    (src / "wiki" / "projects").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / ".curator").mkdir(parents=True)
+    parent = (wiki_a / "wiki" / "concepts" / "transformer.md").read_text()
+    body = parent.split("---", 2)[-1]
+    (src / "wiki" / "concepts" / "transformer.md").write_text(
+        "---\ntitle: Transformer\ntype: concept\nprojects: [other]\n"
+        f"---{body}")
+    (src / "wiki" / "concepts" / "only-src.md").write_text(
+        "---\ntitle: Only\ntype: concept\n---\n\nNew page.\n")
+    res = run_script("merge.py", str(src), "--as-origin", "alice",
+                     "--workspace", str(wiki_a), env=env_with_ce)
+    assert "stem fallback (no IRI): concepts/transformer.md (identical)" \
+        in res.stderr
+    run_script("merge.py", "--apply", "alice",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    assert (wiki_a / "wiki" / "concepts" / "transformer.md").is_file()
+    assert not (wiki_a / "wiki" / "concepts"
+                / "transformer-from-alice.md").exists()
+    assert (wiki_a / "wiki" / "concepts" / "only-src.md").is_file()
+
+
+def test_iri_required_refuses_stem_fallback(
+        wiki_a: Path, wiki_b: Path, env_with_ce):
+    res = run_script(
+        "merge.py", str(wiki_b), "--as-origin", "bob",
+        "--iri-required", "--workspace", str(wiki_a),
+        env=env_with_ce, check=False,
+    )
+    assert res.returncode != 0
+    assert "--iri-required" in res.stderr
+    assert "stem fallback" in res.stderr
+    # Staging left so the audit is readable; not on the apply queue.
+    assert (wiki_a / ".curator" / ".merge-staging" / "bob").is_dir()
+    queue = wiki_a / ".curator" / "merge-queue.json"
+    if queue.is_file():
+        data = json.loads(queue.read_text())
+        assert "bob" not in data.get("origins", [])
+
+
+def test_apply_queue_fifo_one_rebuild(wiki_a: Path, env_with_ce, tmp_path):
+    """Point 4: two origins staged against the parent, --apply-queue
+    lands both and drains the FIFO. Overlapping identical pages from the
+    second origin must not clobber or spawn *-from-origin.md."""
+    def _mini(name: str, extra_page: str, transformer_projects: str) -> Path:
+        root = tmp_path / name
+        (root / "wiki" / "concepts").mkdir(parents=True)
+        (root / "vault").mkdir(parents=True)
+        (root / ".curator").mkdir(parents=True)
+        parent_t = (wiki_a / "wiki" / "concepts" / "transformer.md").read_text()
+        body = parent_t.split("---", 2)[-1]
+        (root / "wiki" / "concepts" / "transformer.md").write_text(
+            "---\ntitle: Transformer\ntype: concept\n"
+            f"projects: [{transformer_projects}]\n---{body}")
+        (root / "wiki" / "concepts" / extra_page).write_text(
+            f"---\ntitle: {extra_page}\ntype: concept\n---\n\n{extra_page}\n")
+        return root
+
+    s1 = _mini("shard-a", "alpha.md", "aa")
+    s2 = _mini("shard-b", "beta.md", "bb")
+    run_script("merge.py", str(s1), "--as-origin", "sharda",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    run_script("merge.py", str(s2), "--as-origin", "shardb",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    queue = json.loads(
+        (wiki_a / ".curator" / "merge-queue.json").read_text())
+    assert queue["origins"] == ["sharda", "shardb"]
+    run_script("merge.py", "--apply-queue",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    assert (wiki_a / "wiki" / "concepts" / "alpha.md").is_file()
+    assert (wiki_a / "wiki" / "concepts" / "beta.md").is_file()
+    assert not (wiki_a / "wiki" / "concepts"
+                / "transformer-from-sharda.md").exists()
+    assert not (wiki_a / "wiki" / "concepts"
+                / "transformer-from-shardb.md").exists()
+    q2 = wiki_a / ".curator" / "merge-queue.json"
+    if q2.is_file():
+        assert json.loads(q2.read_text()).get("origins") == []
+    assert not (wiki_a / ".curator" / ".merge-staging" / "sharda").exists()
+    assert not (wiki_a / ".curator" / ".merge-staging" / "shardb").exists()
+
+
+def test_acl_intersect_only_on_analysis(wiki_a: Path, env_with_ce, tmp_path):
+    """Point 3: --acl intersect trims `projects:` on analysis pages to
+    the intersection; other types stay keep-receiver."""
+    analyses = wiki_a / "wiki" / "analyses"
+    analyses.mkdir(parents=True)
+    (analyses / "synth.md").write_text(
+        "---\ntitle: Synth\ntype: analysis\n"
+        "projects: [ml-foundations, keep-me]\n---\n\nShared body.\n")
+    src = tmp_path / "wiki-acl"
+    (src / "wiki" / "analyses").mkdir(parents=True)
+    (src / "wiki" / "concepts").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / ".curator").mkdir(parents=True)
+    (src / "wiki" / "analyses" / "synth.md").write_text(
+        "---\ntitle: Synth\ntype: analysis\n"
+        "projects: [ml-foundations, incoming-only]\n---\n\nShared body.\n")
+    run_script("merge.py", str(src), "--as-origin", "acl",
+               "--acl", "intersect", "--workspace", str(wiki_a),
+               env=env_with_ce)
+    run_script("merge.py", "--apply", "acl",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    fm = (analyses / "synth.md").read_text().split("---", 2)[1]
+    assert "ml-foundations" in fm
+    assert "keep-me" not in fm
+    assert "incoming-only" not in fm
+
+
 # --- unmerge ---------------------------------------------------------------
 
 

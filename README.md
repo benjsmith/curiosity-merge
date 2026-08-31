@@ -43,6 +43,9 @@ uv run python3 <skill_path>/scripts/merge.py /tmp/their-wiki --as-origin someone
 # Rejoin a U4 shard on its seam IRIs (identity-keyed, not slug-keyed)
 uv run python3 <skill_path>/scripts/merge.py \
     --import-shard /tmp/shard-export.json /tmp/shard-wiki --as-origin shard1
+
+# Parallel shards: stage each, then apply FIFO with one graph rebuild
+uv run python3 <skill_path>/scripts/merge.py --apply-queue
 ```
 
 Merge reconciles entities by stable IRI (curiosity-engine U1) when pages
