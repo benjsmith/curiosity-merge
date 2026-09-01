@@ -55,7 +55,7 @@ curiosity-merge/
 │   ├── subgraph_export.py
 │   ├── discover_bridges.py
 │   ├── merge.py
-│   ├── reconcile.py         # vault sha256 + page-stem collision helpers (stem fallback)
+│   ├── reconcile.py         # vault sha256 + page-stem collision helpers (stem fallback, source-stub link folds)
 │   ├── identity.py          # IRI-keyed entity reconciliation (U1) + shard seam joins (U4)
 │   └── merge_evolve_guard.sh # hash-guard (named distinctly from curiosity-engine's evolve_guard.sh)
 └── template/
@@ -129,7 +129,7 @@ The receiving workspace's `merge` command reads `_export-manifest.json` if prese
 The atomic swap is a separate command (`merge.py --apply <origin>`) that:
 
 1. Refuses if `_suspect/` is non-empty, or if the stage was `--iri-required` with stem fallbacks
-2. Copies staging into live `wiki/` and `vault/` with dest-clobber guards (identical unframed body → skip; dest taken → `<stem>-from-<origin>.md`; never overwrite a different body)
+2. Copies staging into live `wiki/` and `vault/` with dest-clobber guards (identical unframed body → skip; source stubs differing only in `[[wikilinks]]` → fold the links into the live stub; dest taken → `<stem>-from-<origin>.md`; never overwrite a different body)
 3. Unions `same_as` (and `--acl` `projects:` policy) into canonical identity pages
 4. Runs `graph.py rebuild wiki` unless `--no-rebuild`
 5. Appends/drains `.curator/merge-queue.json`. `merge.py --apply-queue` applies every queued origin FIFO and rebuilds the graph once.

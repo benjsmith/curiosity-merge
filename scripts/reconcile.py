@@ -16,7 +16,8 @@ Concepts:
 
   page_collisions        list of dicts describing each page-name clash.
                          { stem, incoming_path, existing_path, kind }
-                         kind ∈ {identical, same_topic, different_topic}.
+                         kind ∈ {identical, source_link_fold, same_topic,
+                         different_topic}.
                          The merge driver uses kind to decide write strategy.
 """
 from __future__ import annotations
@@ -31,7 +32,7 @@ _ce_scripts = os.environ.get("CURIOSITY_ENGINE_SCRIPTS_DIR")
 if _ce_scripts and _ce_scripts not in sys.path:
     sys.path.insert(0, _ce_scripts)
 try:
-    from naming import read_frontmatter  # type: ignore
+    from naming import read_frontmatter, WIKILINK_RE  # type: ignore
 except ImportError as e:
     sys.stderr.write(f"reconcile.py: cannot import naming.py ({e})\n")
     raise
@@ -173,6 +174,155 @@ def reconcile_vault(
     }
 
 
+# --- source stubs: wikilink-only differences -------------------------------
+#
+# A `wiki/sources/<stem>.md` stub is a thin provenance page: title, a
+# citation, and the reciprocal `[[page]]` links back to whatever cites it.
+# Parallel shard CURATE rewires exactly those links, so the same stub comes
+# back from N shards with N different link sets and nothing else changed.
+# Forking those into `sources/<stem>-from-<origin>.md` floods the parent
+# wiki with duplicate source pages. The signature below is what the stub
+# says *apart from* its links; when two stubs agree on it, the links get
+# folded together instead of forking.
+
+_LIST_MARKER_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+# The heading a reciprocal-link block gets written under. CURATE adds the
+# label and the links together, so a stub that gained its first backlink
+# gained this line too; ignoring the label keeps that a fold rather than a
+# fork. Deliberately a closed list — any other added prose is real content
+# and must still fork.
+_LINK_LABEL_RE = re.compile(
+    r"^#{0,6}\s*(?:cited by|cites|citing pages|related|related pages|"
+    r"links|linked from|backlinks|references|referenced by|see also)$",
+    re.IGNORECASE,
+)
+_SEPARATOR_RUN_RE = re.compile(r"\s*[,;|·•]+\s*")
+_TRAILING_PUNCT_RE = re.compile(r"[\s,;:|·•—–-]+$")
+_ALNUM_RE = re.compile(r"[0-9A-Za-z]")
+
+# Conservative slug shape for a folded link target. Folded links are the one
+# thing an origin gets to write into a live receiver page without passing
+# through staging, so keep the accepted alphabet tight: no traversal, no
+# markup, no newlines.
+_SAFE_LINK_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,127}$")
+
+
+def link_target(token: str) -> str:
+    """`[[stem|display]]` / `[[stem#heading]]` → `stem`."""
+    inner = token[2:-2]
+    inner = inner.split("|", 1)[0].split("#", 1)[0]
+    return inner.strip()
+
+
+def wikilink_targets(body: str) -> list[str]:
+    """Ordered, case-insensitively deduped `[[link]]` targets in `body`."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in WIKILINK_RE.finditer(body):
+        t = link_target(m.group(0))
+        if t and t.lower() not in seen:
+            seen.add(t.lower())
+            out.append(t)
+    return out
+
+
+def safe_link_target(target: str) -> bool:
+    """True when `target` is a plain wiki slug we're willing to fold."""
+    return bool(_SAFE_LINK_RE.match(target)) and ".." not in target
+
+
+def stub_signature(text: str) -> str:
+    """What a page says with its wikilinks removed.
+
+    Wikilinks are dropped, then list markers, separator punctuation and
+    whitespace are normalized away, then lines left with no alphanumeric
+    content at all (a bare `- [[link]]` bullet, say) are discarded, along
+    with the bare label a link block sits under (`Cited by:`). Two stubs
+    whose signatures match differ only in which pages they link to.
+    """
+    lines: list[str] = []
+    for line in page_body(text).splitlines():
+        line = WIKILINK_RE.sub(" ", line)
+        line = _LIST_MARKER_RE.sub("", line)
+        line = _SEPARATOR_RUN_RE.sub(" ", line)
+        line = re.sub(r"\s+", " ", line).strip()
+        line = _TRAILING_PUNCT_RE.sub("", line)
+        if not _ALNUM_RE.search(line):
+            continue
+        if _LINK_LABEL_RE.match(line):
+            continue
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def is_source_page(path: Path, *, rel: str | None = None,
+                   text: str | None = None) -> bool:
+    """True for `sources/` pages and for anything with `type: source`."""
+    parts = Path(rel).parts if rel else (path.parent.name,)
+    if "sources" in parts:
+        return True
+    if text is None:
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            return False
+    fm, _ = read_frontmatter(text)
+    return (fm.get("type") or "") == "source"
+
+
+def is_source_link_fold(incoming_text: str, existing_text: str) -> bool:
+    """True when two source stubs differ only in their wikilinks.
+
+    Callers must have established that both pages are source stubs; this
+    only judges the bodies. Identical bodies are *not* a fold — those are
+    already handled as an identical-body drop.
+    """
+    if page_body(incoming_text) == page_body(existing_text):
+        return False
+    return stub_signature(incoming_text) == stub_signature(existing_text)
+
+
+def missing_wikilinks(canonical_text: str, links: list[str]) -> list[str]:
+    """`links` (in order) that the canonical page does not already carry."""
+    have = {t.lower() for t in wikilink_targets(page_body(canonical_text))}
+    out: list[str] = []
+    for t in links:
+        key = t.lower()
+        if key in have or not safe_link_target(t):
+            continue
+        have.add(key)
+        out.append(t)
+    return out
+
+
+_FRAME_END = "<!-- END UNTRUSTED MERGED CONTENT -->"
+
+
+def fold_wikilinks(canonical_text: str,
+                   links: list[str]) -> tuple[str, list[str]]:
+    """Add the links the canonical stub is missing. Returns (text, added).
+
+    Each added link becomes its own `- [[link]]` bullet at the end of the
+    body — inside the untrusted frame when the canonical page carries one,
+    so merged content stays framed. Nothing else about the page is touched,
+    which keeps the fold idempotent: re-folding the same links is a no-op.
+    """
+    added = missing_wikilinks(canonical_text, links)
+    if not added:
+        return canonical_text, []
+    block = "\n".join(f"- [[{t}]]" for t in added)
+    idx = canonical_text.rfind(_FRAME_END)
+    head = (canonical_text if idx == -1 else canonical_text[:idx]).rstrip("\n")
+    tail = "" if idx == -1 else canonical_text[idx:]
+    last = head.splitlines()[-1] if head.splitlines() else ""
+    # Continue an existing link list rather than opening a loose one.
+    joiner = ("\n" if _LIST_MARKER_RE.match(last) and WIKILINK_RE.search(last)
+              else "\n\n")
+    if idx == -1:
+        return head + joiner + block + "\n", added
+    return f"{head}{joiner}{block}\n\n{tail}", added
+
+
 # --- page-name collision classification -----------------------------------
 
 
@@ -189,16 +339,19 @@ def classify_collision(
     incoming_path: Path,
     existing_path: Path,
     *,
+    rel: str | None = None,
     similarity_fn=None,
 ) -> dict:
     """Decide how to handle a page-name collision.
 
     Returns: {
       "stem": <stem>,
-      "kind": "identical" | "same_topic" | "different_topic",
+      "kind": "identical" | "source_link_fold" | "same_topic"
+              | "different_topic",
       "incoming_path": <Path>,
       "existing_path": <Path>,
       "similarity": <float | None>,
+      "fold_links": [<target>, ...],   # source_link_fold only
     }
 
     `similarity_fn(text_a, text_b) -> float` is optional. Without it we
@@ -210,6 +363,11 @@ def classify_collision(
     whose prose matches but whose frontmatter differs (`updated:`,
     `projects:`, a minted `iri:`) are dropped, not staged as
     `<stem>-from-<origin>.md`. Whole-file sha256 is a fast path only.
+
+    `source_link_fold` is the source-stub case one step out from that:
+    both sides are source stubs saying the same thing, and only their
+    `[[wikilinks]]` differ. The incoming links fold into the canonical
+    stub — no `<stem>-from-<origin>.md` for that either.
     """
     if sha256_file(incoming_path) == sha256_file(existing_path):
         return {
@@ -230,8 +388,23 @@ def classify_collision(
             "existing_path": existing_path,
             "similarity": 1.0,
         }
-    text_a = _body_text(incoming_path.read_text(errors="replace"))
-    text_b = _body_text(existing_path.read_text(errors="replace"))
+    inc_text = incoming_path.read_text(errors="replace")
+    exi_text = existing_path.read_text(errors="replace")
+    # Source stubs differing only in reciprocal wikilinks: fold, never fork.
+    if (is_source_page(incoming_path, rel=rel, text=inc_text)
+            and is_source_page(existing_path, rel=rel, text=exi_text)
+            and is_source_link_fold(inc_text, exi_text)):
+        return {
+            "stem": incoming_path.stem,
+            "kind": "source_link_fold",
+            "incoming_path": incoming_path,
+            "existing_path": existing_path,
+            "similarity": 1.0,
+            "fold_links": missing_wikilinks(
+                exi_text, wikilink_targets(page_body(inc_text))),
+        }
+    text_a = _body_text(inc_text)
+    text_b = _body_text(exi_text)
     if similarity_fn is not None:
         sim = float(similarity_fn(text_a, text_b))
     else:
@@ -279,7 +452,7 @@ def find_page_collisions(
             continue
         if rel in existing_by_rel:
             out.append(
-                classify_collision(p, existing_by_rel[rel],
+                classify_collision(p, existing_by_rel[rel], rel=rel,
                                    similarity_fn=similarity_fn)
             )
     return out

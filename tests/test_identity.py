@@ -421,3 +421,43 @@ def test_no_iri_merge_records_no_reconciliations(
              for p in manifest["wiki_pages"]}
     assert pages["concepts/transformer.md"] == \
         "concepts/transformer-from-bob.md"
+
+
+def test_source_stub_with_iri_folds_instead_of_forking(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """A minted source stub takes the same fold path as an un-minted one:
+    identity reconciliation must not turn shard link-rewiring back into a
+    `sources/<stem>-from-<origin>.md` fork."""
+    iri = "https://example.org/id/source/vaswani-2017-attention"
+    stub = wiki_a / "wiki" / "sources" / "vaswani-2017-attention.md"
+    head, fm, body = stub.read_text().split("---", 2)
+    stub.write_text(f"---{fm}iri: {iri}\n---{body}")
+
+    src = tmp_path / "minted-shard"
+    (src / "wiki" / "sources").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / ".curator").mkdir(parents=True)
+    # Same stub under a different slug (identity, not stem, is the join),
+    # with one added reciprocal link.
+    (src / "wiki" / "sources" / "attention-paper.md").write_text(
+        f"---{fm}iri: {iri}\n---{body.rstrip()}\n\n"
+        "Cited by:\n- [[diffusion]]\n"
+    )
+    run_script("merge.py", str(src), "--as-origin", "shardm",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    manifest = json.loads(
+        (wiki_a / ".curator" / ".merge-staging" / "shardm"
+         / "apply.json").read_text())
+    assert [f["existing_rel"] for f in manifest["source_link_folds"]] == \
+        ["sources/vaswani-2017-attention.md"]
+    assert manifest["source_link_folds"][0]["links"] == ["diffusion"]
+    rec = manifest["identity_reconciliations"][0]
+    assert rec["is_source_link_fold"] is True
+    assert rec["review_copy_rel"] is None
+
+    run_script("merge.py", "--apply", "shardm",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    sources = wiki_a / "wiki" / "sources"
+    assert sorted(p.name for p in sources.glob("*.md")) == \
+        ["vaswani-2017-attention.md"]
+    assert "[[diffusion]]" in stub.read_text()
