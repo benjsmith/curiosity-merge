@@ -1,5 +1,34 @@
 # Changelog
 
+## v0.8.1 — 2026-09-01
+
+Follow-on to the v0.8.0 shard-rejoin hardening: the identical-body skip covered stubs that came back byte-identical, but not the ones parallel CURATE had rewired.
+
+### Source stubs differing only in wikilinks fold instead of forking
+
+A `wiki/sources/<stem>.md` stub is a thin provenance page — title, citation, and the reciprocal `[[page]]` links back to whatever cites it. Parallel shard CURATE rewires exactly those links, so the same stub returns from N shards with N different link sets and nothing else changed. Body-identity said "different", the similarity heuristic said `same_topic`, and every shard forked the stub: ~N duplicate `sources/<stem>-from-<origin>.md` per shard flooding the parent on rejoin.
+
+`classify_collision` now returns a fourth kind, `source_link_fold`, when both sides are source stubs (`type: source`, or a page under `sources/`) whose bodies match once `[[wikilinks]]`, their list markers and their bare section label (`Cited by:`) are stripped. Those stubs never stage — not as a live page, not as a review copy under `collisions/`. On apply the incoming links are appended to the receiver's stub as `- [[link]]` bullets, deduped against what the stub already carries, so N shards land one stub with the union of their links and zero `*-from-<origin>.md`.
+
+The fold is additive and bounded:
+
+- Only link bullets are added. The receiver's prose, frontmatter and existing links are untouched, which makes re-folding the same links a no-op.
+- Only plain slug targets are accepted (`[A-Za-z0-9][A-Za-z0-9 ._/-]{0,127}`, no `..`). Folded links are the one piece of incoming text that reaches a live page without passing through staging, so the accepted alphabet is deliberately tight.
+- Links land inside the untrusted frame when the receiving stub carries one.
+- The apply path folds too (`_copy_wiki_avoiding_clobber`), so a stub that was new to the receiver when a shard staged, but landed from an earlier origin in the queue by the time it applied, folds rather than forking. Queue order does not change the result.
+- The identity path (U1/U4) folds on the same rule, so a minted `iri:` on a stub cannot turn shard link-rewiring back into a fork.
+- `--acl` applies to a fold exactly as to an identical-body drop; `keep-receiver` (the default) leaves `projects:` alone.
+
+Real content collisions are unchanged: any other differing line on a stub, and every collision on entity / concept / analysis pages, still takes the existing `same_topic` / `different_topic` review-copy path. ACL, the apply queue, and the `--allow-iris` skip are untouched.
+
+Folded stubs are listed in the audit under `## Page-name collisions → Source stubs — wikilinks folded` with the links folded in, and recorded in the manifest as `source_link_folds`.
+
+### Fixes
+
+`unmerge.py` no longer crashes on a manifest containing pages that never landed as files (`final_rel: null` — identical-body drops, and now folds).
+
+189 tests passing (was 184 at v0.8.0).
+
 ## v0.8.0 — 2026-08-31
 
 Federation hardening after an 8-way parallel-shard curate/rejoin.

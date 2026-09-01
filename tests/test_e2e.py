@@ -513,6 +513,175 @@ def test_acl_intersect_only_on_analysis(wiki_a: Path, env_with_ce, tmp_path):
     assert "incoming-only" not in fm
 
 
+# --- source-stub wikilink folds -------------------------------------------
+
+
+def _link_shard(root: Path, wiki_a: Path, page: str) -> Path:
+    """A shard export that adds one reciprocal `[[page]]` link to the
+    parent's source stub, exactly as a parallel CURATE pass would: the
+    stub's prose is untouched, `updated:` is bumped, and the new concept
+    page that prompted the backlink rides along."""
+    (root / "wiki" / "concepts").mkdir(parents=True)
+    (root / "wiki" / "sources").mkdir(parents=True)
+    (root / "vault").mkdir(parents=True)
+    (root / ".curator").mkdir(parents=True)
+    stub = (wiki_a / "wiki" / "sources" / "vaswani-2017-attention.md").read_text()
+    head, fm, body = stub.split("---", 2)
+    (root / "wiki" / "sources" / "vaswani-2017-attention.md").write_text(
+        f"---{fm}updated: 2026-09-01\n---{body.rstrip()}\n\n"
+        f"Cited by:\n- [[{page}]]\n"
+    )
+    (root / "wiki" / "concepts" / f"{page}.md").write_text(
+        f"---\ntitle: {page}\ntype: concept\n---\n\n"
+        f"Reads [[vaswani-2017-attention]].\n"
+    )
+    return root
+
+
+def test_source_stub_wikilink_fold_keeps_one_stub(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """Two shards add different `[[page]]` links to the same source stub.
+    The merge must yield one stub carrying both links and zero
+    sources/*-from-<origin>.md forks."""
+    s1 = _link_shard(tmp_path / "link-shard-a", wiki_a, "alpha")
+    s2 = _link_shard(tmp_path / "link-shard-b", wiki_a, "beta")
+    res1 = run_script("merge.py", str(s1), "--as-origin", "sharda",
+                      "--workspace", str(wiki_a), env=env_with_ce)
+    assert ("stem fallback (no IRI): sources/vaswani-2017-attention.md "
+            "(source_link_fold)") in res1.stderr
+    run_script("merge.py", str(s2), "--as-origin", "shardb",
+               "--workspace", str(wiki_a), env=env_with_ce)
+
+    # Staging never materializes the stub — not as a live page, not as a
+    # review copy.
+    for origin in ("sharda", "shardb"):
+        staging = wiki_a / ".curator" / ".merge-staging" / origin
+        assert not (staging / "wiki-incoming" / "sources"
+                    / "vaswani-2017-attention.md").exists()
+        assert list((staging / "collisions").rglob("*.md")) == []
+        manifest = json.loads((staging / "apply.json").read_text())
+        folds = manifest["source_link_folds"]
+        assert [f["existing_rel"] for f in folds] == \
+               ["sources/vaswani-2017-attention.md"]
+        assert folds[0]["links"] == ["alpha" if origin == "sharda" else "beta"]
+
+    run_script("merge.py", "--apply-queue",
+               "--workspace", str(wiki_a), env=env_with_ce)
+
+    sources = wiki_a / "wiki" / "sources"
+    assert sorted(p.name for p in sources.glob("*.md")) == \
+        ["vaswani-2017-attention.md"]
+    assert not list(sources.glob("*-from-*.md"))
+    stub = (sources / "vaswani-2017-attention.md").read_text()
+    assert "[[alpha]]" in stub and "[[beta]]" in stub
+    # The receiver's own prose and frontmatter survive untouched.
+    assert "Source extraction. (vault:vaswani-2017-attention.extracted.md)" \
+        in stub
+    assert "ml-foundations" in stub.split("---", 2)[1]
+    # Both shards' new concept pages still land as ordinary new pages.
+    assert (wiki_a / "wiki" / "concepts" / "alpha.md").is_file()
+    assert (wiki_a / "wiki" / "concepts" / "beta.md").is_file()
+
+
+def test_source_stub_fold_is_idempotent(wiki_a: Path, env_with_ce, tmp_path):
+    """Re-merging a shard whose links the receiver already has changes
+    nothing — no duplicate bullet, no fork."""
+    s1 = _link_shard(tmp_path / "link-shard-once", wiki_a, "alpha")
+    for origin in ("first", "second"):
+        run_script("merge.py", str(s1), "--as-origin", origin,
+                   "--workspace", str(wiki_a), env=env_with_ce)
+        run_script("merge.py", "--apply", origin,
+                   "--workspace", str(wiki_a), env=env_with_ce)
+    stub = (wiki_a / "wiki" / "sources"
+            / "vaswani-2017-attention.md").read_text()
+    assert stub.count("[[alpha]]") == 1
+    assert not list((wiki_a / "wiki" / "sources").glob("*-from-*.md"))
+
+
+def test_source_stub_fold_at_apply_time_when_stub_is_new(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """The stub is new to the parent, so neither shard sees a collision at
+    stage time. The first origin lands it; the second must fold into it at
+    apply time rather than forking."""
+    def _shard(name: str, page: str) -> Path:
+        root = tmp_path / name
+        (root / "wiki" / "concepts").mkdir(parents=True)
+        (root / "wiki" / "sources").mkdir(parents=True)
+        (root / "vault").mkdir(parents=True)
+        (root / ".curator").mkdir(parents=True)
+        (root / "wiki" / "sources" / "kingma-2013-vae.md").write_text(
+            '---\ntitle: "Auto-Encoding Variational Bayes"\n'
+            "type: source\nsource_url: https://arxiv.org/abs/1312.6114\n"
+            f"---\n\nSource extraction.\n\nCited by:\n- [[{page}]]\n"
+        )
+        (root / "wiki" / "concepts" / f"{page}.md").write_text(
+            f"---\ntitle: {page}\ntype: concept\n---\n\n"
+            "Reads [[kingma-2013-vae]].\n"
+        )
+        return root
+
+    run_script("merge.py", str(_shard("vae-a", "vae")), "--as-origin",
+               "sharda", "--workspace", str(wiki_a), env=env_with_ce)
+    run_script("merge.py", str(_shard("vae-b", "elbo")), "--as-origin",
+               "shardb", "--workspace", str(wiki_a), env=env_with_ce)
+    # Neither stage saw a collision: the parent had no such stub, so the
+    # stage-time fold never fires and the apply path is what's under test.
+    for origin in ("sharda", "shardb"):
+        manifest = json.loads(
+            (wiki_a / ".curator" / ".merge-staging" / origin
+             / "apply.json").read_text())
+        assert not manifest.get("source_link_folds")
+    res = run_script("merge.py", "--apply-queue",
+                     "--workspace", str(wiki_a), env=env_with_ce)
+    assert "folded 1 wikilink(s)" in res.stderr
+
+    sources = wiki_a / "wiki" / "sources"
+    assert not list(sources.glob("kingma-2013-vae-from-*.md"))
+    stub = (sources / "kingma-2013-vae.md").read_text()
+    assert "[[vae]]" in stub and "[[elbo]]" in stub
+    # Folded links stay inside the untrusted frame.
+    assert stub.index("[[elbo]]") < stub.index(
+        "<!-- END UNTRUSTED MERGED CONTENT -->")
+
+
+def test_real_content_collisions_still_fork(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """The fold is scoped to source stubs whose prose matches. A source
+    stub with different prose, and a concept page differing only by a
+    wikilink, both keep the existing review-copy behavior."""
+    src = tmp_path / "content-diff"
+    (src / "wiki" / "sources").mkdir(parents=True)
+    (src / "wiki" / "concepts").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / ".curator").mkdir(parents=True)
+    (src / "wiki" / "sources" / "vaswani-2017-attention.md").write_text(
+        '---\ntitle: "Attention Is All You Need - Vaswani, 2017"\n'
+        "type: source\nprojects: [other]\n---\n\n"
+        "A different summary of the same paper, rewritten by hand.\n"
+        "(vault:vaswani-2017-attention.extracted.md)\n"
+    )
+    # Concept page: body differs only by an added wikilink — still a
+    # content collision, because folding is a source-stub rule.
+    concept = (wiki_a / "wiki" / "concepts" / "attention.md").read_text()
+    head, fm, body = concept.split("---", 2)
+    (src / "wiki" / "concepts" / "attention.md").write_text(
+        f"---{fm}---{body.rstrip()}\n\nCited by:\n- [[diffusion]]\n")
+    run_script("merge.py", str(src), "--as-origin", "carol",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    manifest = json.loads(
+        (wiki_a / ".curator" / ".merge-staging" / "carol"
+         / "apply.json").read_text())
+    assert manifest["source_link_folds"] == []
+    kinds = {c["stem"]: c["kind"] for c in manifest["page_collisions"]}
+    assert kinds["vaswani-2017-attention"] in ("same_topic", "different_topic")
+    assert kinds["attention"] in ("same_topic", "different_topic")
+    run_script("merge.py", "--apply", "carol",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    forks = sorted(
+        p.name for p in (wiki_a / "wiki").rglob("*-from-carol.md"))
+    assert forks == ["attention-from-carol.md",
+                     "vaswani-2017-attention-from-carol.md"]
+
 # --- unmerge ---------------------------------------------------------------
 
 

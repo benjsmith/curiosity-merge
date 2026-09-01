@@ -121,7 +121,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--acl", choices=("keep-receiver", "union", "intersect"),
                     default="keep-receiver",
                     help="how `projects:` tags combine when two pages become "
-                         "one (identity collapse or identical-body drop). "
+                         "one (identity collapse, identical-body drop, or "
+                         "source-stub wikilink fold). "
                          "keep-receiver (default): never mutate the survivor. "
                          "union: add incoming tags. intersect: receiver ∩ "
                          "incoming, but only on type: analysis pages "
@@ -654,12 +655,14 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
 
     L.append("## Page-name collisions")
     L.append("")
-    by_kind: dict[str, list[dict]] = {"identical": [], "same_topic": [],
-                                       "different_topic": []}
+    by_kind: dict[str, list[dict]] = {"identical": [], "source_link_fold": [],
+                                       "same_topic": [], "different_topic": []}
     for c in page_collisions:
         by_kind.setdefault(c["kind"], []).append(c)
     L.append(f"- identical (kept one; not copied to wiki/): "
              f"{len(by_kind['identical'])}")
+    L.append(f"- source stub, wikilinks only (folded into the existing "
+             f"stub): {len(by_kind['source_link_fold'])}")
     L.append(f"- same topic (preserved both, manual review): "
              f"{len(by_kind['same_topic'])}")
     L.append(f"- different topic (incoming renamed): "
@@ -681,6 +684,25 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
             L.append(f"- `{fb.get('rel')}` ({fb.get('kind')})")
         if len(stem_fb) > 50:
             L.append(f"- ... and {len(stem_fb) - 50} more")
+    folds = manifest.get("source_link_folds") or []
+    if folds:
+        L.append("")
+        L.append("### Source stubs — wikilinks folded")
+        L.append("")
+        L.append(
+            "These incoming `type: source` stubs say the same thing as the "
+            "receiver's, and differ only in which pages link to them (what "
+            "parallel shard CURATE produces when it rewires reciprocal "
+            "links). Their links are folded into the existing stub on apply; "
+            "no `<stem>-from-<origin>.md` is created and nothing else about "
+            "the receiver's stub changes."
+        )
+        L.append("")
+        for f in folds[:50]:
+            links = ", ".join(f"`[[{t}]]`" for t in f.get("links") or [])
+            L.append(f"- `{f.get('existing_rel')}` ← {links or '(no new links)'}")
+        if len(folds) > 50:
+            L.append(f"- ... and {len(folds) - 50} more")
     if by_kind["same_topic"]:
         L.append("")
         L.append("### Same topic — manual review queue")
@@ -726,6 +748,10 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
         identical_id = [r for r in recs if r.get("bodies_identical")]
         L.append(f"- identical body (no review copy in wiki/): "
                  f"{len(identical_id)}")
+        folded_id = [r for r in recs if r.get("is_source_link_fold")]
+        if folded_id:
+            L.append(f"- source stubs folded (wikilinks merged, no review "
+                     f"copy): {len(folded_id)}")
         if is_shard:
             L.append(f"- seam joins (parent already held the IRI): {len(seams)}")
         L.append("")
@@ -749,7 +775,10 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
             L.append("")
             for r in slug_changes[:50]:
                 review = r.get("review_copy_rel")
-                if r.get("bodies_identical") or not review:
+                if r.get("is_source_link_fold"):
+                    extra = ("source stub — wikilinks folded into the "
+                             "canonical stub, no review copy")
+                elif r.get("bodies_identical") or not review:
                     extra = "bodies identical — no review copy"
                 else:
                     extra = (f"wikilinks redirected; incoming body preserved "
@@ -879,14 +908,18 @@ def _write_audit(staging: dict, *, origin: str, source: Path,
     drops = manifest.get("identical_body_drops") or []
     if drops:
         L.append(f"- identical-body drops (not copied to wiki/): {len(drops)}")
+    if folds:
+        L.append(f"- source stubs folded (links merged, not copied to "
+                 f"wiki/): {len(folds)}")
     acl = manifest.get("acl") or "keep-receiver"
     L.append(f"- ACL policy: `{acl}`")
     if manifest.get("allow_iris") is not None:
         L.append(f"- allow-iris: {len(manifest['allow_iris'])} IRI(s)")
-    if drops and acl == "keep-receiver":
+    if (drops or folds) and acl == "keep-receiver":
         L.append("")
-        L.append("Incoming `projects:` on dropped/collapsed pages were "
-                 "not applied (keep-receiver). `--acl union` to add them.")
+        L.append("Incoming `projects:` on dropped/collapsed/folded pages "
+                 "were not applied (keep-receiver). `--acl union` to add "
+                 "them.")
     L.append("")
 
     staging["audit"].write_text("\n".join(L) + "\n")
@@ -1098,16 +1131,34 @@ def cmd_stage(args) -> int:
         r["incoming_type"] = inc_fm.get("type") or ""
         canon_rel = r.get("canonical_rel") or r["incoming_rel"]
         canon_path = receiver_wiki / canon_rel if r.get("canonical_rel") else None
+        both_files = bool(inc_path.is_file() and canon_path is not None
+                          and canon_path.is_file())
         bodies_identical = bool(
-            inc_path.is_file() and canon_path is not None
-            and canon_path.is_file()
+            both_files
             and reconcile.body_sha256(inc_path) == reconcile.body_sha256(canon_path)
         )
         r["bodies_identical"] = bodies_identical
+        # Source stubs that differ only in their reciprocal wikilinks fold
+        # into the canonical stub, same as on the stem path — a minted IRI
+        # must not turn the shard-rewiring case back into a fork.
+        r["fold_links"] = []
+        r["is_source_link_fold"] = False
+        if both_files and not bodies_identical:
+            inc_text = inc_path.read_text(errors="replace")
+            canon_text = canon_path.read_text(errors="replace")
+            if (reconcile.is_source_page(inc_path, rel=r["incoming_rel"],
+                                         text=inc_text)
+                    and reconcile.is_source_page(canon_path, rel=canon_rel,
+                                                 text=canon_text)
+                    and reconcile.is_source_link_fold(inc_text, canon_text)):
+                r["fold_links"] = reconcile.missing_wikilinks(
+                    canon_text,
+                    reconcile.wikilink_targets(reconcile.page_body(inc_text)))
+                r["is_source_link_fold"] = True
         # Review copy only when the incoming body actually differs. Identical
         # bodies must not materialize as <stem>-from-<origin>.md in live wiki/.
         r["review_copy_rel"] = (
-            None if bodies_identical
+            None if bodies_identical or r.get("is_source_link_fold")
             else reconcile.collision_target_rel(canon_rel, origin)
         )
         identity_collapse[r["incoming_rel"]] = r
@@ -1123,10 +1174,17 @@ def cmd_stage(args) -> int:
         if str(c["incoming_path"].relative_to(src_wiki)) not in identity_collapse
     ]
     collision_targets: dict[str, str] = {}
+    fold_links_by_rel: dict[str, list[str]] = {}
     for c in collisions:
         rel = str(c["incoming_path"].relative_to(src_wiki))
         if c["kind"] == "identical":
             collision_targets[rel] = "__drop__"
+        elif c["kind"] == "source_link_fold":
+            # Source stub whose body differs only in reciprocal wikilinks
+            # (parallel shard CURATE rewiring). Fold the links into the
+            # receiver's stub at apply time; never fork the stub.
+            collision_targets[rel] = "__fold_links__"
+            fold_links_by_rel[rel] = list(c.get("fold_links") or [])
         elif c["kind"] == "different_topic":
             collision_targets[rel] = reconcile.collision_target_rel(rel, origin)
         else:  # same_topic
@@ -1147,14 +1205,25 @@ def cmd_stage(args) -> int:
     # 4. Walk every incoming wiki page; transform; write to staging.
     manifest_pages: list[dict] = []
     identical_body_drops: list[dict] = []
+    source_link_folds: list[dict] = []
     for p in src_wiki.rglob("*.md"):
         rel = str(p.relative_to(src_wiki))
         if any(seg.startswith(".") for seg in rel.split(os.sep)):
             continue
         collapsed = identity_collapse.get(rel)
-        drop_identical = False
+        not_staged = None  # manifest label when the page never lands as a file
         if collapsed is not None:
-            if collapsed.get("bodies_identical") or not collapsed.get("review_copy_rel"):
+            if collapsed.get("is_source_link_fold"):
+                source_link_folds.append({
+                    "incoming_rel": rel,
+                    "existing_rel": collapsed.get("canonical_rel") or rel,
+                    "links": [slug_redirect.get(t, t)
+                              for t in collapsed.get("fold_links") or []],
+                    "incoming_projects": collapsed.get("incoming_projects") or [],
+                    "incoming_type": collapsed.get("incoming_type") or "",
+                })
+                not_staged = "folded-wikilinks"
+            elif collapsed.get("bodies_identical") or not collapsed.get("review_copy_rel"):
                 identical_body_drops.append({
                     "incoming_rel": rel,
                     "existing_rel": collapsed.get("canonical_rel") or rel,
@@ -1162,7 +1231,7 @@ def cmd_stage(args) -> int:
                     "incoming_type": collapsed.get("incoming_type") or "",
                     "kind": "identity",
                 })
-                drop_identical = True
+                not_staged = "dropped-identical-body"
             else:
                 target_rel = collapsed["review_copy_rel"]
                 staged_under = staging["collisions"]
@@ -1181,7 +1250,18 @@ def cmd_stage(args) -> int:
                     "incoming_type": inc_fm.get("type") or "",
                     "kind": "stem",
                 })
-                drop_identical = True
+                not_staged = "dropped-identical-body"
+            elif disp == "__fold_links__":
+                inc_fm, _ = read_frontmatter(p.read_text(errors="replace"))
+                source_link_folds.append({
+                    "incoming_rel": rel,
+                    "existing_rel": rel,
+                    "links": [slug_redirect.get(t, t)
+                              for t in fold_links_by_rel.get(rel, [])],
+                    "incoming_projects": _projects_list(inc_fm.get("projects")),
+                    "incoming_type": inc_fm.get("type") or "",
+                })
+                not_staged = "folded-wikilinks"
             elif disp.startswith("__same_topic__:"):
                 target_rel = disp.split(":", 1)[1]
                 staged_under = staging["collisions"]
@@ -1192,11 +1272,11 @@ def cmd_stage(args) -> int:
             target_rel = rel
             staged_under = staging["wiki_in"]
 
-        if drop_identical:
+        if not_staged is not None:
             manifest_pages.append({
                 "incoming_rel": rel,
                 "final_rel": None,
-                "staged_under": "dropped-identical-body",
+                "staged_under": not_staged,
                 "sha256_at_import": reconcile.sha256_file(p),
             })
             continue
@@ -1372,6 +1452,7 @@ def cmd_stage(args) -> int:
         "stem_fallbacks": stem_fallbacks,
         "iri_required": bool(args.iri_required),
         "identical_body_drops": identical_body_drops,
+        "source_link_folds": source_link_folds,
         "preflight_summary": preflight.manifest_summary(preflight_findings),
         "preflight_findings": preflight_findings_safe,
         "incoming_manifest_warnings": incoming_manifest_warnings,
@@ -1401,13 +1482,37 @@ def cmd_stage(args) -> int:
     return 0
 
 
+def _fold_source_links(src: Path, dest: Path) -> list[str]:
+    """Fold `src`'s wikilinks into source stub `dest`, if that's all that differs.
+
+    Returns the links added ([] when the pages aren't a source-stub
+    link-fold pair, so callers can fall through to the clobber-avoiding
+    rename). This is the apply-time half of the stage-time
+    `source_link_fold` classification: by the time a queued origin
+    applies, the receiver's stub may already have grown links from an
+    earlier origin, so the union is recomputed against the live page.
+    """
+    src_text = src.read_text(errors="replace")
+    dest_text = dest.read_text(errors="replace")
+    if not (reconcile.is_source_page(src, text=src_text)
+            and reconcile.is_source_page(dest, text=dest_text)
+            and reconcile.is_source_link_fold(src_text, dest_text)):
+        return []
+    folded, added = reconcile.fold_wikilinks(
+        dest_text, reconcile.wikilink_targets(reconcile.page_body(src_text)))
+    if added:
+        dest.write_text(folded)
+    return added
+
+
 def _copy_wiki_avoiding_clobber(src: Path, dest: Path, origin: str,
                                 receiver_wiki: Path) -> str:
     """Copy a staged wiki page without overwriting a different live page.
 
-    Identical unframed bodies → skip. Dest taken → rename to
-    `<stem>-from-<origin>.md`. Already-namespaced dest with a different
-    body is left in place (never clobber).
+    Identical unframed bodies → skip. Source stubs differing only in
+    their wikilinks → fold the links into the live stub. Dest taken →
+    rename to `<stem>-from-<origin>.md`. Already-namespaced dest with a
+    different body is left in place (never clobber).
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     if not dest.exists():
@@ -1415,6 +1520,12 @@ def _copy_wiki_avoiding_clobber(src: Path, dest: Path, origin: str,
         return "copied"
     if reconcile.body_sha256(src) == reconcile.body_sha256(dest):
         return "skipped"
+    folded = _fold_source_links(src, dest)
+    if folded:
+        sys.stderr.write(
+            f"merge: apply — folded {len(folded)} wikilink(s) into {dest} "
+            f"({', '.join(folded)})\n")
+        return "folded"
     alt_rel = reconcile.collision_target_rel(
         str(dest.relative_to(receiver_wiki)), origin)
     alt = receiver_wiki / alt_rel
@@ -1587,6 +1698,28 @@ def cmd_apply(args) -> int:
             incoming_type=r.get("incoming_type") or "",
             acl=acl,
         )
+
+    # Source-stub link folds: the incoming stub never staged as a file, so
+    # its links are carried in the manifest. Fold them into the receiver's
+    # stub (skipping any it already has — an earlier origin in the queue may
+    # have landed the same link) instead of forking a *-from-<origin>.md.
+    for fold in manifest.get("source_link_folds") or []:
+        existing = fold.get("existing_rel")
+        if not existing:
+            continue
+        page = receiver_wiki / existing
+        if page.is_file():
+            text = page.read_text(errors="replace")
+            folded, added = reconcile.fold_wikilinks(
+                text, fold.get("links") or [])
+            if added:
+                page.write_text(folded)
+                sys.stderr.write(
+                    f"merge: apply — folded {len(added)} wikilink(s) into "
+                    f"{existing} ({', '.join(added)})\n")
+        _apply_acl_projects(
+            page, fold.get("incoming_projects") or [],
+            acl=acl, incoming_type=fold.get("incoming_type") or "")
 
     # Identical-body stem drops: ACL may still union/intersect projects onto
     # the surviving receiver page. keep-receiver is a no-op.

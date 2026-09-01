@@ -112,6 +112,10 @@ def _page_origin(text: str) -> str:
 def _imported_stems_and_vault(manifest: dict) -> tuple[set[str], set[str]]:
     page_stems: set[str] = set()
     for entry in manifest["wiki_pages"]:
+        # final_rel is None for pages that never landed as a file
+        # (identical-body drops, source-stub wikilink folds).
+        if not entry.get("final_rel"):
+            continue
         page_stems.add(Path(entry["final_rel"]).stem.lower())
     vault_rels: set[str] = set()
     for v in manifest["vault_files"]:
