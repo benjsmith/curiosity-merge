@@ -113,6 +113,7 @@ def test_match_by_iri_and_by_same_as(identity_mod, tmp_path):
     assert r["canonical_slug"] == "aspirin"
     assert r["incoming_slug"] == "asa"
     assert r["union_same_as"] == {"pubchem": "CID2244", "wikidata": "Q18216"}
+    assert r["incoming_same_as"] == {"pubchem": "CID2244", "wikidata": "Q18216"}
 
 
 def test_no_identity_returns_no_matches(identity_mod, tmp_path):
@@ -461,3 +462,468 @@ def test_source_stub_with_iri_folds_instead_of_forking(
     assert sorted(p.name for p in sources.glob("*.md")) == \
         ["vaswani-2017-attention.md"]
     assert "[[diffusion]]" in stub.read_text()
+
+
+# --- same_as reversal planning (pure) -------------------------------------
+
+
+def test_plan_same_as_reversal_last_claimer_and_restore(identity_mod):
+    incoming = {"pubchem": "CID2244", "wikidata": "Q2"}
+    current = {"pubchem": "CID2244", "wikidata": "Q2"}
+    original = {"pubchem": "CID2244"}
+    remaining = {"wikidata": "Q1"}
+    d = identity_mod.plan_same_as_reversal(
+        incoming_same_as=incoming,
+        added_same_as={"wikidata": "Q2"},
+        current=current,
+        original=original,
+        remaining=remaining,
+        remaining_claimers={"wikidata:Q1": ["labb"]},
+    )
+    assert d["remove"] == {}
+    assert d["restore"] == {"wikidata": "Q1"}
+    assert d["keep_original"] == [{"key": "pubchem", "value": "CID2244"}]
+    assert d["precise"] is True
+
+    d2 = identity_mod.plan_same_as_reversal(
+        incoming_same_as={"wikidata": "Q18216"},
+        added_same_as={"wikidata": "Q18216"},
+        current={"pubchem": "CID2244", "wikidata": "Q18216"},
+        original={"pubchem": "CID2244"},
+        remaining={},
+    )
+    assert d2["remove"] == {"wikidata": "Q18216"}
+
+    d3 = identity_mod.plan_same_as_reversal(
+        incoming_same_as={"wikidata": "Q18216"},
+        added_same_as={},
+        current={"pubchem": "CID2244", "wikidata": "Q18216"},
+        original={"pubchem": "CID2244"},
+        remaining={"wikidata": "Q18216"},
+        remaining_claimers={"wikidata:Q18216": ["labc"]},
+    )
+    assert d3["remove"] == {}
+    assert d3["keep_claimed"][0]["by"] == ["labc"]
+
+    d4 = identity_mod.plan_same_as_reversal(
+        incoming_same_as={"wikidata": "Q18216"},
+        added_same_as={"wikidata": "Q18216"},
+        current={"pubchem": "CID2244", "wikidata": "Q999"},
+        original={"pubchem": "CID2244"},
+        remaining={},
+    )
+    assert d4["remove"] == {}
+    assert d4["skip_user_edit"][0]["current"] == "Q999"
+
+    d5 = identity_mod.plan_same_as_reversal(
+        incoming_same_as={"wikidata": "Q18216"},
+        added_same_as=None,
+        current={"wikidata": "Q18216"},
+        original=None,
+        remaining={},
+    )
+    assert d5["precise"] is False
+    assert d5["remove"] == {}
+    assert d5["skip_imprecise"]
+
+
+def test_apply_same_as_reversal_respects_live_value(identity_mod):
+    new = identity_mod.apply_same_as_reversal(
+        {"pubchem": "CID2244", "wikidata": "Q2"},
+        incoming_same_as={"wikidata": "Q2"},
+        remove={},
+        restore={"wikidata": "Q1"},
+    )
+    assert new == {"pubchem": "CID2244", "wikidata": "Q1"}
+    # User changed the value between stage and apply: leave it.
+    skipped = identity_mod.apply_same_as_reversal(
+        {"pubchem": "CID2244", "wikidata": "Q999"},
+        incoming_same_as={"wikidata": "Q2"},
+        remove={"wikidata": "Q2"},
+        restore={},
+    )
+    assert skipped["wikidata"] == "Q999"
+
+
+def test_collect_remaining_claims_skips_old_manifests(identity_mod):
+    others = [
+        ("old", {"applied_at": "2026-01-01T00:00:00Z",
+                 "identity_reconciliations": [{
+                     "canonical_iri": "ce:x",
+                     "union_same_as": {"wikidata": "Q1"},
+                 }]}),
+        ("new", {"applied_at": "2026-02-01T00:00:00Z",
+                 "identity_reconciliations": [{
+                     "canonical_iri": "ce:x",
+                     "incoming_same_as": {"wikidata": "Q1", "drugbank": "DB1"},
+                 }]}),
+    ]
+    remaining, claimers = identity_mod.collect_remaining_claims(
+        others, canonical_iri="ce:x", canonical_rel=None)
+    assert remaining == {"wikidata": "Q1", "drugbank": "DB1"}
+    assert claimers["wikidata:Q1"] == ["new"]
+
+
+def test_original_same_as_uses_earliest_prior_including_archive(identity_mod):
+    manifests = [
+        ("labc-unmerged-1", {
+            "applied_at": "2026-02-01T00:00:00Z",
+            "identity_reconciliations": [{
+                "canonical_iri": "ce:x",
+                "prior_page_same_as": {"pubchem": "CID2244", "wikidata": "Q1"},
+            }],
+        }),
+        ("labb", {
+            "applied_at": "2026-01-01T00:00:00Z",
+            "identity_reconciliations": [{
+                "canonical_iri": "ce:x",
+                "prior_page_same_as": {"pubchem": "CID2244"},
+            }],
+        }),
+    ]
+    assert identity_mod.original_same_as(
+        manifests, canonical_iri="ce:x", canonical_rel=None) == \
+        {"pubchem": "CID2244"}
+
+
+# --- unmerge reverses identity same_as ------------------------------------
+
+
+def _page_iri(path: Path) -> str:
+    for line in path.read_text().splitlines():
+        if line.startswith("iri:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError(f"no iri in {path}")
+
+
+def _db_same_as(workspace: Path, iri: str):
+    import sqlite3
+    db = workspace / ".curator" / "identifiers.db"
+    if not db.is_file():
+        return None
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute(
+            "SELECT same_as_json FROM entities WHERE iri = ?", (iri,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return json.loads(row[0]) if row else None
+
+
+def test_unmerge_round_trip_same_as(minted_pair, env_with_ce):
+    wsa, wsb = minted_pair
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    page = wsa / "wiki" / "entities" / "aspirin.md"
+    iri = _page_iri(page)
+    assert "wikidata:Q18216" in page.read_text()
+    persisted = json.loads(
+        (wsa / ".curator" / "merges" / "labb.json").read_text())
+    rec = persisted["identity_reconciliations"][0]
+    assert rec["incoming_same_as"]["wikidata"] == "Q18216"
+    assert rec["added_same_as"]["wikidata"] == "Q18216"
+    assert rec["prior_page_same_as"] == {"pubchem": "CID2244"}
+    assert rec["db_row_existed_before"] is True
+    review = wsa / "wiki" / "entities" / "aspirin-from-labb.md"
+    assert review.is_file()
+
+    run_script("unmerge.py", "--origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    plan = json.loads(
+        (wsa / ".curator" / ".unmerge-staging" / "labb" / "plan.json").read_text())
+    rev = plan["identity_reversals"][0]
+    assert rev["remove"] == {"wikidata": "Q18216"}
+    audit = (wsa / ".curator" / ".unmerge-staging" / "labb"
+             / "audit-report.md").read_text()
+    assert "Identity reconciliations to reverse" in audit
+    assert "wikidata:Q18216" in audit
+
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = page.read_text()
+    assert "wikidata:Q18216" not in text
+    assert "pubchem:CID2244" in text
+    assert not review.exists()
+    assert _db_same_as(wsa, iri) == {"pubchem": "CID2244"}
+    # Native page that linked [[aspirin]] is untouched (no unmerge comment).
+    native = (wsa / "wiki" / "projects" / "pharma.md").read_text()
+    assert "[[aspirin]]" in native
+    assert "<!-- unmerge:" not in native
+
+
+def test_unmerge_keep_identity_same_as(minted_pair, env_with_ce):
+    wsa, wsb = minted_pair
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb", "--keep-identity-same-as",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    assert "wikidata:Q18216" in text
+    assert "pubchem:CID2244" in text
+
+
+def test_unmerge_preserves_user_edited_pair(minted_pair, env_with_ce):
+    wsa, wsb = minted_pair
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    page = wsa / "wiki" / "entities" / "aspirin.md"
+    page.write_text(page.read_text().replace("wikidata:Q18216", "wikidata:Q999"))
+    run_script("unmerge.py", "--origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = page.read_text()
+    assert "wikidata:Q999" in text
+    assert "wikidata:Q18216" not in text
+    assert "pubchem:CID2244" in text
+
+
+def test_unmerge_last_claimer_across_two_origins(minted_pair, env_with_ce, tmp_path):
+    wsa, wsb = minted_pair
+    wsc = tmp_path / "wsc"
+    _scaffold(wsc)
+    _write(wsc / "wiki" / "entities" / "asa.md",
+           "---\ntitle: ASA\ntype: concept\nentity_class: chemical\n"
+           "iri: ce:chemical:wsc:asa\n"
+           "same_as: [pubchem:CID2244, wikidata:Q18216]\nprojects: [c]\n"
+           "---\n\nThird shard, same pair.\n")
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", str(wsc), "--as-origin", "labc",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labc",
+               "--workspace", str(wsa), env=env_with_ce)
+    page = wsa / "wiki" / "entities" / "aspirin.md"
+    assert "wikidata:Q18216" in page.read_text()
+
+    # Introducer first: the second origin still claims the pair.
+    run_script("unmerge.py", "--origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    assert "wikidata:Q18216" in page.read_text()
+    assert "pubchem:CID2244" in page.read_text()
+
+    run_script("unmerge.py", "--origin", "labc",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labc", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = page.read_text()
+    assert "wikidata:Q18216" not in text
+    assert "pubchem:CID2244" in text
+
+
+def test_unmerge_restores_overwritten_authority(minted_pair, env_with_ce, tmp_path):
+    wsa, wsb = minted_pair
+    wsc = tmp_path / "wsc"
+    _scaffold(wsc)
+    _write(wsc / "wiki" / "entities" / "asa.md",
+           "---\ntitle: ASA\ntype: concept\nentity_class: chemical\n"
+           "iri: ce:chemical:wsc:asa\n"
+           "same_as: [pubchem:CID2244, wikidata:Q2]\nprojects: [c]\n"
+           "---\n\nConflicting wikidata id.\n")
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", str(wsc), "--as-origin", "labc",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labc",
+               "--workspace", str(wsa), env=env_with_ce)
+    page = wsa / "wiki" / "entities" / "aspirin.md"
+    assert "wikidata:Q2" in page.read_text()
+    assert "wikidata:Q18216" not in page.read_text()
+
+    run_script("unmerge.py", "--origin", "labc",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labc", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = page.read_text()
+    assert "wikidata:Q18216" in text
+    assert "wikidata:Q2" not in text
+
+
+def test_unmerge_old_manifest_does_not_guess(minted_pair, env_with_ce):
+    wsa, wsb = minted_pair
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    path = wsa / ".curator" / "merges" / "labb.json"
+    m = json.loads(path.read_text())
+    for r in m["identity_reconciliations"]:
+        r.pop("incoming_same_as", None)
+        r.pop("added_same_as", None)
+        r.pop("prior_page_same_as", None)
+    path.write_text(json.dumps(m, indent=2) + "\n")
+    run_script("unmerge.py", "--origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    audit = (wsa / ".curator" / ".unmerge-staging" / "labb"
+             / "audit-report.md").read_text()
+    assert "predates precise-reversal tracking" in audit
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    assert "wikidata:Q18216" in (
+        wsa / "wiki" / "entities" / "aspirin.md").read_text()
+
+
+def test_unmerge_deletes_db_row_this_merge_created(tmp_path, env_with_ce):
+    wsa = tmp_path / "wsa"
+    wsb = tmp_path / "wsb"
+    _scaffold(wsa)
+    _scaffold(wsb)
+    iri = "ce:chemical:wsa:aspirin"
+    _write(wsa / "wiki" / "entities" / "aspirin.md",
+           f"---\ntitle: Aspirin\ntype: concept\nentity_class: chemical\n"
+           f"iri: {iri}\nprojects: [pharma]\n"
+           f"---\n\nAspirin, a salicylate.\n")
+    _write(wsb / "wiki" / "entities" / "asa.md",
+           f"---\ntitle: ASA\ntype: concept\nentity_class: chemical\n"
+           f"iri: {iri}\nsame_as: [wikidata:Q18216]\nprojects: [chem]\n"
+           f"---\n\nSame molecule.\n")
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    persisted = json.loads(
+        (wsa / ".curator" / "merges" / "labb.json").read_text())
+    assert persisted["identity_reconciliations"][0]["db_row_existed_before"] is False
+    assert _db_same_as(wsa, iri) == {"wikidata": "Q18216"}
+    run_script("unmerge.py", "--origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    assert _db_same_as(wsa, iri) is None
+    text = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    assert "wikidata:Q18216" not in text
+    assert "same_as:" not in text.split("---", 2)[1]
+
+
+def test_unmerge_identical_body_identity_does_not_crash(
+        minted_pair, env_with_ce, tmp_path):
+    """v0.8.0/v0.8.1: final_rel null must not crash unmerge; no review copy
+    is invented; same_as still reverses."""
+    wsa, _ = minted_pair
+    parent = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    body = parent.split("---", 2)[-1]
+    iri = parent.split("iri: ", 1)[1].split("\n", 1)[0].strip()
+    shard = tmp_path / "shard-ident"
+    _scaffold(shard)
+    _write(shard / "wiki" / "entities" / "asa.md",
+           "---\ntitle: ASA\ntype: concept\nentity_class: chemical\n"
+           f"iri: {iri}\nsame_as: [pubchem:CID2244, wikidata:Q18216]\n"
+           f"projects: [s]\n---{body}")
+    export = tmp_path / "ident-export.json"
+    export.write_text(json.dumps({
+        "seed": "entities/asa.md",
+        "shard_size": 1,
+        "pages": ["entities/asa.md"],
+        "iri_entities_in_shard": 1,
+        "seam_entities": [{
+            "page": "entities/asa.md", "iri": iri,
+            "external_linkers": []}],
+    }))
+    run_script("merge.py", "--import-shard", str(export), str(shard),
+               "--as-origin", "shard1", "--workspace", str(wsa),
+               env=env_with_ce)
+    run_script("merge.py", "--apply", "shard1",
+               "--workspace", str(wsa), env=env_with_ce)
+    wiki_ents = wsa / "wiki" / "entities"
+    assert not (wiki_ents / "aspirin-from-shard1.md").exists()
+    assert "wikidata:Q18216" in (wiki_ents / "aspirin.md").read_text()
+    run_script("unmerge.py", "--origin", "shard1",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "shard1", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = (wiki_ents / "aspirin.md").read_text()
+    assert "wikidata:Q18216" not in text
+    assert "pubchem:CID2244" in text
+    assert not (wiki_ents / "aspirin-from-shard1.md").exists()
+
+
+def test_unmerge_does_not_unfold_source_stub_links(
+        wiki_a: Path, env_with_ce, tmp_path):
+    """v0.8.1 fold must survive identity unmerge (frontmatter-only)."""
+    iri = "https://example.org/id/source/vaswani-2017-attention"
+    stub = wiki_a / "wiki" / "sources" / "vaswani-2017-attention.md"
+    head, fm, body = stub.read_text().split("---", 2)
+    stub.write_text(f"---{fm}iri: {iri}\n---{body}")
+    src = tmp_path / "minted-shard"
+    (src / "wiki" / "sources").mkdir(parents=True)
+    (src / "vault").mkdir(parents=True)
+    (src / ".curator").mkdir(parents=True)
+    (src / "wiki" / "sources" / "attention-paper.md").write_text(
+        f"---{fm}iri: {iri}\n---{body.rstrip()}\n\n"
+        "Cited by:\n- [[diffusion]]\n"
+    )
+    run_script("merge.py", str(src), "--as-origin", "shardm",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    run_script("merge.py", "--apply", "shardm",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    assert "[[diffusion]]" in stub.read_text()
+    run_script("unmerge.py", "--origin", "shardm",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "shardm", "--apply",
+               "--workspace", str(wiki_a), env=env_with_ce)
+    assert "[[diffusion]]" in stub.read_text()
+    sources = wiki_a / "wiki" / "sources"
+    assert sorted(p.name for p in sources.glob("*.md")) == \
+        ["vaswani-2017-attention.md"]
+
+
+def test_unmerge_does_not_reverse_acl_union(minted_pair, env_with_ce):
+    wsa, wsb = minted_pair
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--acl", "union", "--workspace", str(wsa), env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    fm = (wsa / "wiki" / "entities" / "aspirin.md").read_text().split("---", 2)[1]
+    assert "pharma" in fm
+    assert "chem" in fm
+    assert "wikidata:Q18216" not in fm
+
+
+def test_allow_iris_namespaced_origin_is_not_a_claimer(
+        minted_pair, env_with_ce, tmp_path):
+    """An --allow-iris-namespaced origin never unions, so it must not
+    keep a pair alive after the origin that actually unioned is unmerged."""
+    wsa, wsb = minted_pair
+    parent = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    listed = parent.split("iri: ", 1)[1].split("\n", 1)[0].strip()
+    allow = tmp_path / "allow.txt"
+    allow.write_text(f"{listed}\n")
+    # wsb's aspirin match is listed (collapses); ibuprofen is unlisted.
+    run_script("merge.py", str(wsb), "--as-origin", "labb",
+               "--allow-iris", str(allow), "--workspace", str(wsa),
+               env=env_with_ce)
+    run_script("merge.py", "--apply", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    persisted = json.loads(
+        (wsa / ".curator" / "merges" / "labb.json").read_text())
+    iris = [r.get("canonical_iri") or r.get("incoming_iri")
+            for r in persisted["identity_reconciliations"]]
+    assert listed in iris
+    assert not any(i and "ibuprofen" in i for i in iris)
+    run_script("unmerge.py", "--origin", "labb",
+               "--workspace", str(wsa), env=env_with_ce)
+    run_script("unmerge.py", "--origin", "labb", "--apply",
+               "--workspace", str(wsa), env=env_with_ce)
+    text = (wsa / "wiki" / "entities" / "aspirin.md").read_text()
+    assert "wikidata:Q18216" not in text
+    assert (wsa / "wiki" / "entities" / "ibuprofen-from-labb.md").is_file() is False
+    # namespaced first-seen ibuprofen is a pure import, removed.

@@ -120,13 +120,16 @@ Ingests a bounded sub-wiki **shard** — the output of curiosity-engine's `epoch
 uv run python3 <skill_path>/scripts/unmerge.py --origin <name>
 uv run python3 <skill_path>/scripts/unmerge.py --origin <name> --apply
 uv run python3 <skill_path>/scripts/unmerge.py --origin <name> --abandon
+uv run python3 <skill_path>/scripts/unmerge.py --origin <name> --keep-identity-same-as
 ```
 
 Reverses an earlier `merge`, surgically. Reads `.curator/merges/<origin>.json` (the manifest written by `merge.py --apply`) and partitions every imported page/vault file into three buckets:
 
-- **Pure imports** — still tagged `origin: <name>`, sha256 unchanged since import. Safe to remove.
+- **Pure imports** — still tagged `origin: <name>`, sha256 unchanged since import. Safe to remove. Unchanged identity review copies (`<stem>-from-<origin>.md`) are treated as pure imports; stem same-topic collisions stay manual.
 - **User-modified imports** — still tagged but sha256 differs. User has curated this page since the merge. **Never silently deleted**; staged for review with the original-import version preserved alongside.
 - **Already de-imported** — user already pruned it. Logged, no action.
+
+**Identity `same_as` unions are reversed** on the receiver-native canonical page and `.curator/identifiers.db`. Merge records this origin's claim-set (`incoming_same_as`) at apply; unmerge drops a pair only when no remaining active origin still claims it and the receiver did not have it before any of these merges. Conflicting values for one authority restore the remaining claim (inverse of incoming-wins). User-edited pairs are skipped. `--keep-identity-same-as` leaves the mappings in place. Old manifests without the new keys are not guessed. Folded source-stub wikilinks and `projects:` ACL are not reversed.
 
 Walks the rest of the wiki for **native pages that reference imported content** (wikilinks `[[<imported-stem>]]` or citations `(vault:<imported-rel>)`); these are the user's own curation built on top of the imports. Their references will become dead links after unmerge — the script rewrites them to plain `[[stem]]` form, appends an audit comment, and lists every affected page in the audit report so the user can decide what to do.
 
@@ -166,7 +169,7 @@ If alphaxiv isn't installed and an arXiv source needed PDF fallback, the script 
 - **Manipulated `(vault:...)` citations** pointing at non-existent or wrong-content vault files. **Defence**: every vault file referenced from merged pages must exist in the merged-vault index by sha256; citations to missing or sha-mismatched content get rewritten or flagged in the audit report.
 - **Path traversal in CLI args** (`--to ../../../etc/passwd`). **Defence**: paths containing `..` segments or absolute paths outside the workspace are rejected at argv-parse time.
 - **Page-name collisions on substantive pages** (both wikis have `concepts/transformer.md` with different content). **Defence**: NEVER silently overwrite. Always queue for human review with both versions preserved. Identical **bodies** (frontmatter may differ) drop the incoming page — they do not land as `<stem>-from-<origin>.md` in live `wiki/`. Source stubs differing only in `[[wikilinks]]` fold their links into the receiver's stub instead of forking; the fold is additive (link bullets only, from a restricted slug alphabet) and never rewrites the receiver's prose or frontmatter.
-- **Identity reconciliation respects the same posture** — when an incoming entity matches a receiver identity by `iri`/`same_as`, the receiver's page stays canonical and is never overwritten by untrusted incoming content. Different incoming bodies are preserved under `collisions/` for review; identical bodies are not copied into live `wiki/`. Only the additive `same_as` union is written into the receiver (`projects:` stays keep-receiver unless `--acl union`). A spoofed incoming `iri` can at most attach extra `same_as` pairs to an entity the receiver already owns (visible in the audit) — it cannot replace the canonical page or its content.
+- **Identity reconciliation respects the same posture** — when an incoming entity matches a receiver identity by `iri`/`same_as`, the receiver's page stays canonical and is never overwritten by untrusted incoming content. Different incoming bodies are preserved under `collisions/` for review; identical bodies are not copied into live `wiki/`. Only the additive `same_as` union is written into the receiver (`projects:` stays keep-receiver unless `--acl union`). A spoofed incoming `iri` can at most attach extra `same_as` pairs to an entity the receiver already owns (visible in the audit) — it cannot replace the canonical page or its content. Unmerge reverses that union by last-claimer (a pair stays while another active origin still claims it, or the receiver originally had it); it does not un-fold source-stub wikilinks or reverse `projects:` ACL.
 
 See `docs/trust-model.md` for the full threat list and decision rationale.
 
@@ -208,7 +211,7 @@ See `docs/trust-model.md` for the full gate list, the rationale for opt-in defau
 | `subgraph-export` | shipped (v0.1) |
 | `discover-bridges` + `accept-bridges` | shipped (v0.1) |
 | `merge` (IRI-keyed, shard import, queue, ACL, allow-iris) | shipped (v0.1, vault-missing v0.2, identity v0.6, federation v0.8) |
-| `unmerge` | shipped (v0.1) |
+| `unmerge` | shipped (v0.1, identity same_as reversal v0.8.2) |
 | `hydrate-vault` | shipped (v0.2) |
 
 Each verb is independently shippable; `subgraph-export` is useful immediately even without the other two.

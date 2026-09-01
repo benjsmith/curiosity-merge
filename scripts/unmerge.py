@@ -24,6 +24,12 @@ Cross-origin bridges accepted at merge time (recorded in the manifest's
 `accepted_bridges`) are unwound: the wikilink in the native page that
 connected to the imported page is removed and logged.
 
+Identity `same_as` unions on receiver-native pages are reversed by
+last-claimer (see identity.plan_same_as_reversal) unless
+`--keep-identity-same-as`. Folded source-stub wikilinks and `projects:`
+ACL are not reversed. Pages that never landed as a file (`final_rel`
+null — identical-body drops, source-stub folds) are skipped.
+
 Why not `git revert`? A git revert would also undo any of the user's
 curation commits since the merge. The whole point of unmerge is to
 surgically extract just the merge-introduced content while preserving
@@ -53,6 +59,7 @@ if _ce_scripts and _ce_scripts not in sys.path:
 try:
     from naming import (  # type: ignore
         read_frontmatter,
+        set_frontmatter_field,
         WIKILINK_RE,
         CITATION_RE,
     )
@@ -63,6 +70,7 @@ except ImportError as e:
 
 sys.path.insert(0, str(Path(__file__).parent))
 import reconcile  # type: ignore
+import identity  # type: ignore
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -76,6 +84,9 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="atomic swap of staged unmerge into live tree")
     ap.add_argument("--abandon", action="store_true",
                     help="discard staged unmerge")
+    ap.add_argument("--keep-identity-same-as", action="store_true",
+                    help="do not reverse identity same_as unions; keep "
+                         "identifier mappings this origin contributed")
     return ap
 
 
@@ -137,13 +148,42 @@ def _classify_imports(workspace: Path, origin: str, manifest: dict) -> dict:
     modified_vault: list[dict] = []
     gone_vault: list[dict] = []
 
+    identity_review_copies = {
+        r["review_copy_rel"]
+        for r in (manifest.get("identity_reconciliations") or [])
+        if r.get("review_copy_rel")
+    }
+
     for entry in manifest["wiki_pages"]:
-        # We only auto-remove pages that landed in `wiki-incoming/`.
-        # Same-topic-collision pages went into `collisions/` and the user
-        # kept both — those need explicit human treatment, leave alone.
+        # Pages that never landed as a file (identical-body drops,
+        # source-stub wikilink folds). Skipping here completes the
+        # v0.8.1 final_rel:null guard — _imported_stems_and_vault
+        # already skipped them, but this loop used to Path / None.
+        if not entry.get("final_rel"):
+            continue
+        # We only auto-remove pages that landed in `wiki-incoming/`,
+        # plus unchanged identity review copies (merge-introduced
+        # cruft; the canonical receiver page is the real one).
+        # Stem same-topic collisions stay manual (T5).
         if entry.get("staged_under") == "collisions":
+            rel = entry["final_rel"]
+            path = wiki / rel
+            if rel in identity_review_copies and path.is_file():
+                current_sha = reconcile.sha256_file(path)
+                if current_sha == entry.get("sha256_at_import"):
+                    pure_pages.append({
+                        "final_rel": rel,
+                        "reason": "identity-review-copy",
+                    })
+                else:
+                    modified_pages.append({
+                        "final_rel": rel,
+                        "import_sha256": entry.get("sha256_at_import"),
+                        "current_sha256": current_sha,
+                    })
+                continue
             gone_pages.append({
-                "final_rel": entry["final_rel"],
+                "final_rel": rel,
                 "reason": "same-topic collision; preserved by design — manual",
             })
             continue
@@ -197,6 +237,155 @@ def _classify_imports(workspace: Path, origin: str, manifest: dict) -> dict:
         "pure_vault": pure_vault, "modified_vault": modified_vault,
         "gone_vault": gone_vault,
     }
+
+
+def _add_rematch_review_copies(workspace: Path, origin: str,
+                               manifest: dict, classification: dict) -> None:
+    """Apply-time rematch review copies are not in wiki_pages as collisions."""
+    already = {e["final_rel"] for e in classification["pure_pages"]}
+    already |= {e["final_rel"] for e in classification["modified_pages"]}
+    wiki = workspace / "wiki"
+    for r in manifest.get("identity_reconciliations") or []:
+        rel = r.get("review_copy_rel")
+        if not rel or rel in already:
+            continue
+        path = wiki / rel
+        if not path.is_file():
+            continue
+        if _page_origin(path.read_text(errors="replace")) != origin:
+            continue
+        expected = r.get("sha256_at_import")
+        current_sha = reconcile.sha256_file(path)
+        if expected and current_sha == expected:
+            classification["pure_pages"].append({
+                "final_rel": rel,
+                "reason": "identity-review-copy",
+            })
+        elif expected:
+            classification["modified_pages"].append({
+                "final_rel": rel,
+                "import_sha256": expected,
+                "current_sha256": current_sha,
+            })
+
+
+def _plan_identity_reversals(workspace: Path, origin: str,
+                             manifest: dict) -> list[dict]:
+    """Build per-entity same_as reversal records (claim-set / last-claimer)."""
+    merges_dir = workspace / ".curator" / "merges"
+    others = identity.load_active_merge_manifests(
+        merges_dir, exclude_origin=origin)
+    # Archived origins are not claimers, but their prior_page_same_as is
+    # the only record of the pre-federation page (the introducer may
+    # already have been unmerged).
+    all_manifests = (
+        list(others)
+        + identity.load_archived_merge_manifests(merges_dir)
+        + [(origin, manifest)]
+    )
+    wiki = workspace / "wiki"
+    out: list[dict] = []
+    for r in manifest.get("identity_reconciliations") or []:
+        if not isinstance(r, dict):
+            continue
+        canon_rel = r.get("canonical_rel")
+        canon_iri = r.get("canonical_iri")
+        incoming = r.get("incoming_same_as")
+        rec = {
+            "canonical_rel": canon_rel,
+            "canonical_iri": canon_iri,
+            "review_copy_rel": r.get("review_copy_rel"),
+            "db_row_existed_before": bool(r.get("db_row_existed_before")),
+            "incoming_same_as": incoming if isinstance(incoming, dict) else None,
+            "added_same_as": r.get("added_same_as")
+            if isinstance(r.get("added_same_as"), dict) else None,
+            "precise": True,
+            "remove": {},
+            "restore": {},
+            "keep_claimed": [],
+            "keep_original": [],
+            "skip_user_edit": [],
+            "skip_imprecise": [],
+        }
+        if not isinstance(incoming, dict):
+            rec["precise"] = False
+            rec["skip_imprecise"] = [{
+                "reason": "manifest predates precise-reversal tracking",
+            }]
+            out.append(rec)
+            continue
+        current: dict = {}
+        if canon_rel:
+            page = wiki / canon_rel
+            if page.is_file():
+                fm, _ = read_frontmatter(page.read_text(errors="replace"))
+                current = identity.parse_same_as(fm.get("same_as"))
+        remaining, claimers = identity.collect_remaining_claims(
+            others, canonical_iri=canon_iri, canonical_rel=canon_rel)
+        original = identity.original_same_as(
+            all_manifests, canonical_iri=canon_iri, canonical_rel=canon_rel)
+        decision = identity.plan_same_as_reversal(
+            incoming_same_as=incoming,
+            added_same_as=rec["added_same_as"],
+            current=current,
+            original=original,
+            remaining=remaining,
+            remaining_claimers=claimers,
+        )
+        rec.update(decision)
+        out.append(rec)
+    return out
+
+
+def _apply_identity_reversal(wiki: Path, receiver_db: Path, rev: dict) -> None:
+    """Mutate a canonical page + db row per a staged reversal plan.
+
+    Re-reads the live page so a user edit between stage and apply is
+    not clobbered. Does not touch folded wikilinks or `projects:`.
+    """
+    if not rev.get("precise"):
+        return
+    incoming = rev.get("incoming_same_as") or {}
+    canon_rel = rev.get("canonical_rel")
+    if canon_rel:
+        page = wiki / canon_rel
+        if page.is_file():
+            text = page.read_text(errors="replace")
+            fm, _ = read_frontmatter(text)
+            current = identity.parse_same_as(fm.get("same_as"))
+            new = identity.apply_same_as_reversal(
+                current,
+                incoming_same_as=incoming,
+                remove=rev.get("remove") or {},
+                restore=rev.get("restore") or {},
+            )
+            if new != current:
+                if new:
+                    updated = set_frontmatter_field(
+                        text, "same_as", identity.format_same_as_list(new))
+                else:
+                    updated = set_frontmatter_field(text, "same_as", None)
+                if updated != text:
+                    page.write_text(updated)
+    canon_iri = rev.get("canonical_iri")
+    if not canon_iri:
+        return
+    row = identity.read_db_entity(receiver_db, canon_iri)
+    if row is None:
+        return
+    db_current = row.get("same_as") or {}
+    db_new = identity.apply_same_as_reversal(
+        db_current,
+        incoming_same_as=incoming,
+        remove=rev.get("remove") or {},
+        restore=rev.get("restore") or {},
+    )
+    delete_if_empty = not rev.get("db_row_existed_before")
+    if db_new != db_current or (delete_if_empty and not db_new):
+        identity.write_entity_same_as(
+            receiver_db, canon_iri, db_new,
+            delete_if_empty=delete_if_empty,
+        )
 
 
 def _scan_native_references(workspace: Path, origin: str,
@@ -254,6 +443,10 @@ def cmd_stage(args) -> int:
         staging[k].mkdir(parents=True, exist_ok=True)
 
     classification = _classify_imports(workspace, origin, manifest)
+    _add_rematch_review_copies(workspace, origin, manifest, classification)
+
+    keep_identity = bool(getattr(args, "keep_identity_same_as", False))
+    identity_reversals = _plan_identity_reversals(workspace, origin, manifest)
 
     # Stems we plan to remove (only pure imports — user-modified are
     # preserved pending human decision).
@@ -316,6 +509,8 @@ def cmd_stage(args) -> int:
         "gone_vault": classification["gone_vault"],
         "native_edits": native_edits,
         "bridges_to_unwind": bridges,
+        "identity_reversals": identity_reversals,
+        "keep_identity_same_as": keep_identity,
     }
     staging["plan_json"].write_text(
         json.dumps(plan, indent=2, sort_keys=True) + "\n"
@@ -408,6 +603,74 @@ def _write_audit(staging: dict, plan: dict) -> None:
         L.append("_None recorded._")
     L.append("")
 
+    L.append("## Identity reconciliations to reverse")
+    L.append("")
+    if plan.get("keep_identity_same_as"):
+        L.append(
+            "`--keep-identity-same-as`: identifier mappings this origin "
+            "unioned into receiver-native pages will be left in place."
+        )
+        L.append("")
+    reversals = plan.get("identity_reversals") or []
+    if not reversals:
+        L.append("_None._")
+    else:
+        for rev in reversals:
+            label = (rev.get("canonical_iri")
+                     or rev.get("canonical_rel") or "(unknown)")
+            L.append(f"- `{label}`")
+            if rev.get("canonical_rel"):
+                L.append(f"  - page: `{rev['canonical_rel']}`")
+            if not rev.get("precise"):
+                L.append(
+                    "  - same_as union left in place (manifest predates "
+                    "precise-reversal tracking)"
+                )
+                for s in rev.get("skip_imprecise") or []:
+                    if s.get("key"):
+                        L.append(f"    - `{s['key']}:{s.get('value')}`")
+                continue
+            for k, v in (rev.get("remove") or {}).items():
+                L.append(f"  - remove `{k}:{v}`")
+            for k, v in (rev.get("restore") or {}).items():
+                L.append(f"  - restore `{k}:{v}` (remaining/original claim)")
+            for item in rev.get("keep_claimed") or []:
+                by = ", ".join(item.get("by") or []) or "another origin"
+                L.append(
+                    f"  - keep `{item['key']}:{item['value']}` "
+                    f"(still claimed by {by})"
+                )
+            for item in rev.get("keep_original") or []:
+                L.append(
+                    f"  - keep `{item['key']}:{item['value']}` "
+                    f"(receiver had it before any merge)"
+                )
+            for item in rev.get("skip_user_edit") or []:
+                L.append(
+                    f"  - skip `{item.get('key')}` "
+                    f"(page no longer has incoming value "
+                    f"`{item.get('incoming')}`; live is `{item.get('current')}`)"
+                )
+            for item in rev.get("skip_imprecise") or []:
+                if item.get("key"):
+                    L.append(
+                        f"  - skip `{item['key']}:{item.get('value')}` "
+                        f"(original unknown; this origin did not record adding it)"
+                    )
+            if rev.get("db_row_existed_before") is False:
+                L.append("  - db row was created by this merge; "
+                         "deleted if empty after reversal")
+            if rev.get("review_copy_rel"):
+                L.append(f"  - review copy `{rev['review_copy_rel']}` "
+                         "(removed if unchanged since import)")
+        L.append("")
+        if not plan.get("keep_identity_same_as"):
+            L.append(
+                "Folded source-stub wikilinks and `projects:` ACL are not "
+                "reversed. Identical-body drops never landed a file."
+            )
+    L.append("")
+
     staging["audit"].write_text("\n".join(L) + "\n")
 
 
@@ -460,6 +723,16 @@ def cmd_apply(args) -> int:
         path = vault / e["final_rel"]
         if path.is_file():
             path.unlink()
+
+    # 1b. Reverse identity same_as unions on receiver-native pages.
+    keep_identity = bool(
+        getattr(args, "keep_identity_same_as", False)
+        or plan.get("keep_identity_same_as")
+    )
+    if not keep_identity:
+        receiver_db = workspace / ".curator" / "identifiers.db"
+        for rev in plan.get("identity_reversals") or []:
+            _apply_identity_reversal(wiki, receiver_db, rev)
 
     # 2. Annotate native pages whose references will now be dead.
     for e in plan["native_edits"]:

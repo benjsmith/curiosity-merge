@@ -1568,14 +1568,34 @@ def _union_identity_into_receiver(
         canon_rel: str | None, canon_iri: str | None,
         entity_class: str, union: dict,
         incoming_projects: list[str], incoming_type: str,
-        acl: str) -> None:
+        acl: str,
+        incoming_same_as: dict | None = None) -> dict:
+    """Union identity into the receiver page/db. Returns reversal metadata.
+
+    The write itself is unchanged (union + ACL). Metadata is what unmerge
+    needs to reverse *exactly this origin's* ``same_as`` contribution
+    without clobbering later origins or user edits. ``projects:`` is not
+    recorded — ACL reversal is out of scope.
+    """
+    incoming_same_as = dict(incoming_same_as or {})
+    meta = {
+        "prior_page_same_as": {},
+        "added_same_as": {},
+        "db_row_existed_before": False,
+        "incoming_same_as": incoming_same_as,
+    }
     if canon_rel:
         page = receiver_wiki / canon_rel
         if page.is_file():
             text = page.read_text(errors="replace")
             cur_fm, _ = read_frontmatter(text)
-            merged = identity.union_same_as(
-                identity.parse_same_as(cur_fm.get("same_as")), union)
+            prior = identity.parse_same_as(cur_fm.get("same_as"))
+            meta["prior_page_same_as"] = prior
+            meta["added_same_as"] = {
+                k: v for k, v in incoming_same_as.items()
+                if v is not None and prior.get(k) != v
+            }
+            merged = identity.union_same_as(prior, union)
             if merged:
                 updated = set_frontmatter_field(
                     text, "same_as", identity.format_same_as_list(merged))
@@ -1583,7 +1603,18 @@ def _union_identity_into_receiver(
                     page.write_text(updated)
             _apply_acl_projects(
                 page, incoming_projects, acl=acl, incoming_type=incoming_type)
+        else:
+            meta["added_same_as"] = {
+                k: v for k, v in incoming_same_as.items() if v is not None
+            }
+    elif incoming_same_as:
+        meta["added_same_as"] = {
+            k: v for k, v in incoming_same_as.items() if v is not None
+        }
     if canon_iri:
+        meta["db_row_existed_before"] = (
+            identity.read_db_entity(receiver_db, canon_iri) is not None
+        )
         try:
             identity.upsert_entity_union(
                 receiver_db, canon_iri, entity_class=entity_class,
@@ -1592,6 +1623,7 @@ def _union_identity_into_receiver(
             sys.stderr.write(
                 f"merge: could not update identity registry for "
                 f"{canon_iri}: {e}\n")
+    return meta
 
 
 def cmd_apply(args) -> int:
@@ -1627,6 +1659,11 @@ def cmd_apply(args) -> int:
 
     receiver_identity = identity.build_receiver_index(receiver_wiki, receiver_db)
 
+    # Snapshot staged identity recs *before* apply-time rematch appends
+    # any, so the union loop below does not double-apply rematch recs.
+    staged_id_recs = list(manifest.get("identity_reconciliations") or [])
+    apply_rematch_recs: list[dict] = []
+
     # Wiki-incoming: dest-guard + identity re-match (queue FIFO: a prior
     # origin may have landed an entity this shard also carries).
     if staging["wiki_in"].is_dir():
@@ -1649,9 +1686,9 @@ def cmd_apply(args) -> int:
                             break
             if match and match.get("rel"):
                 canon = receiver_wiki / match["rel"]
-                union = identity.union_same_as(
-                    match.get("same_as"), identity.parse_same_as(fm.get("same_as")))
-                _union_identity_into_receiver(
+                inc_sa = identity.parse_same_as(fm.get("same_as"))
+                union = identity.union_same_as(match.get("same_as"), inc_sa)
+                rematch_meta = _union_identity_into_receiver(
                     receiver_wiki, receiver_db,
                     canon_rel=match.get("rel"),
                     canon_iri=match.get("iri"),
@@ -1660,12 +1697,42 @@ def cmd_apply(args) -> int:
                     incoming_projects=_projects_list(fm.get("projects")),
                     incoming_type=fm.get("type") or "",
                     acl=acl,
+                    incoming_same_as=inc_sa,
                 )
-                if canon.is_file() and reconcile.body_sha256(p) == reconcile.body_sha256(canon):
-                    continue
-                review = receiver_wiki / reconcile.collision_target_rel(
-                    match["rel"], origin)
-                _copy_wiki_avoiding_clobber(p, review, origin, receiver_wiki)
+                # Queue FIFO: this page was first-seen at stage, so it is
+                # not in identity_reconciliations. Record the rematch so
+                # unmerge can reverse it. Do not re-run the staged loop
+                # on these recs (see snapshot below).
+                bodies_identical = bool(
+                    canon.is_file()
+                    and reconcile.body_sha256(p) == reconcile.body_sha256(canon)
+                )
+                review_copy_rel = None
+                sha_at_import = None
+                if not bodies_identical:
+                    candidate = reconcile.collision_target_rel(
+                        match["rel"], origin)
+                    review = receiver_wiki / candidate
+                    action = _copy_wiki_avoiding_clobber(
+                        p, review, origin, receiver_wiki)
+                    # A fold writes into the live stub, not a review copy
+                    # — do not tell unmerge to delete a *-from-origin.md
+                    # that was never created (v0.8.1).
+                    if action != "folded" and review.is_file():
+                        review_copy_rel = candidate
+                        sha_at_import = reconcile.sha256_file(review)
+                apply_rematch_recs.append({
+                    "incoming_rel": rel,
+                    "incoming_iri": iri,
+                    "canonical_rel": match.get("rel"),
+                    "canonical_iri": match.get("iri"),
+                    "match_kind": "apply-rematch",
+                    "union_same_as": union,
+                    "review_copy_rel": review_copy_rel,
+                    "bodies_identical": bodies_identical,
+                    "sha256_at_import": sha_at_import,
+                    **rematch_meta,
+                })
                 continue
             dest = receiver_wiki / rel
             _copy_wiki_avoiding_clobber(p, dest, origin, receiver_wiki)
@@ -1686,9 +1753,16 @@ def cmd_apply(args) -> int:
             _copy_vault_avoiding_clobber(p, dest, origin)
 
     # Staged identity reconciliations (U1): union same_as (+ ACL projects).
-    id_recs = manifest.get("identity_reconciliations", [])
-    for r in id_recs:
-        _union_identity_into_receiver(
+    # Capture apply-time prior/added/db-existed onto each rec so unmerge
+    # can reverse this origin's contribution. incoming_same_as was set at
+    # match time; overlay apply-time fields without changing the union.
+    for r in staged_id_recs:
+        inc_sa = r.get("incoming_same_as")
+        if not isinstance(inc_sa, dict):
+            inc_sa = {}
+            # Reconstruct from union − receiver-at-match when possible
+            # (older staging that lacked the field). Empty is safe.
+        meta = _union_identity_into_receiver(
             receiver_wiki, receiver_db,
             canon_rel=r.get("canonical_rel"),
             canon_iri=r.get("canonical_iri"),
@@ -1697,7 +1771,16 @@ def cmd_apply(args) -> int:
             incoming_projects=r.get("incoming_projects") or [],
             incoming_type=r.get("incoming_type") or "",
             acl=acl,
+            incoming_same_as=inc_sa,
         )
+        r["prior_page_same_as"] = meta["prior_page_same_as"]
+        r["added_same_as"] = meta["added_same_as"]
+        r["db_row_existed_before"] = meta["db_row_existed_before"]
+        r["incoming_same_as"] = meta["incoming_same_as"]
+
+    if apply_rematch_recs:
+        staged_id_recs.extend(apply_rematch_recs)
+    manifest["identity_reconciliations"] = staged_id_recs
 
     # Source-stub link folds: the incoming stub never staged as a file, so
     # its links are carried in the manifest. Fold them into the receiver's

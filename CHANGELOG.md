@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.8.2 — 2026-09-01
+
+Unmerge now reverses identity `same_as` unions, including the multi-origin overlap the v0.6.0 plan left out of scope.
+
+### Unmerge reverses identity reconciliation
+
+`merge --apply` unions an incoming entity's `same_as` into a **receiver-native** page and `.curator/identifiers.db`. Unmerge previously only removed origin-tagged imports, so those unions leaked. Apply now records `incoming_same_as` (this origin's claim-set), `added_same_as`, `prior_page_same_as`, and `db_row_existed_before` on each `identity_reconciliations[]` entry — including apply-time rematches from the merge queue, so FIFO order cannot hide a union.
+
+Unmerge subtracts that origin's pairs from the canonical page and db using a **last-claimer** rule, not the apply-time delta:
+
+- A pair stays while any *active* origin still lists it in `incoming_same_as`, or it was on the page before any of these merges (earliest `prior_page_same_as`, including archived manifests so unmerging the introducer first does not freeze later origins' priors as "original").
+- The last remaining claimer drops it.
+- Incoming-wins key conflicts restore the remaining origin's (or original) value.
+- A user edit of that authority is never clobbered (T5).
+- Manifests that predate the new keys are left alone (`precise: false`); no guessing.
+- `--keep-identity-same-as` keeps the mappings as factual knowledge.
+- Unchanged identity review copies (`<stem>-from-<origin>.md`) are auto-removed; stem same-topic collisions stay manual.
+
+Not reversed (deliberate, so v0.8.0/v0.8.1 shard-rejoin guards stay intact): `projects:` ACL, folded source-stub wikilinks, identical-body drops (`final_rel: null` is skipped, completing the v0.8.1 unmerge crash fix in `_classify_imports`). `--allow-iris` namespaced origins never unioned and are not claimers.
+
+204 tests passing (was 189 at v0.8.1).
+
 ## v0.8.1 — 2026-09-01
 
 Follow-on to the v0.8.0 shard-rejoin hardening: the identical-body skip covered stubs that came back byte-identical, but not the ones parallel CURATE had rewired.

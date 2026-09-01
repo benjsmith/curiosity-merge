@@ -265,6 +265,7 @@ def match_identities(
           canonical_rel, canonical_slug, canonical_iri,
           match_kind: "iri" | "same_as",
           shared_pairs: ["auth:id", ...],   # for same_as matches
+          incoming_same_as: {auth: id, ...},  # this origin's claim-set
           union_same_as: {auth: id, ...},
           entity_class,
         }
@@ -321,6 +322,7 @@ def match_identities(
             "canonical_iri": match.get("iri"),
             "match_kind": match_kind,
             "shared_pairs": shared_pairs,
+            "incoming_same_as": dict(inc_same_as),
             "union_same_as": union_same_as(match.get("same_as"), inc_same_as),
             "entity_class": (match.get("entity_class")
                              or inc.get("entity_class") or "concept"),
@@ -374,3 +376,293 @@ def upsert_entity_union(db_path: Path, iri: str, *, entity_class: str,
         conn.commit()
     finally:
         conn.close()
+
+
+def read_db_entity(db_path: Path, iri: str) -> dict | None:
+    """Read one `entities` row read-only. None if missing/unreadable.
+
+    Uses ``PRAGMA query_only=ON`` on a normal connection (not ``mode=ro``,
+    which hangs on live WAL-mode dbs).
+    """
+    if not iri or not db_path.is_file():
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA query_only=ON")
+        cur = conn.execute(
+            "SELECT iri, entity_class, page_path, same_as_json "
+            "FROM entities WHERE iri = ?",
+            (iri,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        iri_v, entity_class, page_path, same_as_json = row
+        return {
+            "rel": page_path or None,
+            "slug": _slug(page_path) if page_path else None,
+            "iri": iri_v,
+            "same_as": parse_same_as(same_as_json),
+            "entity_class": entity_class or "concept",
+        }
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def write_entity_same_as(db_path: Path, iri: str, same_as: dict, *,
+                         delete_if_empty: bool = False) -> str:
+    """Replace an `entities` row's ``same_as_json``.
+
+    Returns ``updated``, ``deleted``, or ``missing``. Does not create a
+    db or row — unmerge only mutates what merge wrote.
+    """
+    if not iri or not db_path.is_file():
+        return "missing"
+    import datetime as _dt
+    conn = sqlite3.connect(str(db_path), timeout=5)
+    try:
+        conn.execute("PRAGMA busy_timeout=5000")
+        cur = conn.execute(
+            "SELECT iri FROM entities WHERE iri = ?", (iri,))
+        if cur.fetchone() is None:
+            return "missing"
+        if delete_if_empty and not same_as:
+            conn.execute("DELETE FROM entities WHERE iri = ?", (iri,))
+            conn.commit()
+            return "deleted"
+        now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.execute(
+            "UPDATE entities SET same_as_json = ?, resolved_at = ? "
+            "WHERE iri = ?",
+            (json.dumps(same_as, separators=(",", ":"), sort_keys=True),
+             now, iri),
+        )
+        conn.commit()
+        return "updated"
+    except sqlite3.DatabaseError:
+        return "missing"
+    finally:
+        conn.close()
+
+
+# --- unmerge reversal (claim-set / last-claimer) --------------------------
+
+
+def rec_matches_entity(r: dict, *, canonical_iri: str | None,
+                       canonical_rel: str | None) -> bool:
+    """True if identity-reconciliation `r` is about this canonical entity."""
+    if not isinstance(r, dict):
+        return False
+    iri = r.get("canonical_iri") or ""
+    if canonical_iri and iri and iri == canonical_iri:
+        return True
+    rel = r.get("canonical_rel") or ""
+    if canonical_rel and rel and rel == canonical_rel:
+        return True
+    return False
+
+
+def _read_manifest_file(path: Path) -> dict | None:
+    try:
+        m = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    return m if isinstance(m, dict) else None
+
+
+def load_active_merge_manifests(
+        merges_dir: Path, *,
+        exclude_origin: str | None = None) -> list[tuple[str, dict]]:
+    """Load `.curator/merges/*.json` (not `.archive/`)."""
+    out: list[tuple[str, dict]] = []
+    if not merges_dir.is_dir():
+        return out
+    for p in sorted(merges_dir.glob("*.json")):
+        origin = p.stem
+        if exclude_origin and origin == exclude_origin:
+            continue
+        m = _read_manifest_file(p)
+        if m is not None:
+            out.append((origin, m))
+    return out
+
+
+def load_archived_merge_manifests(merges_dir: Path) -> list[tuple[str, dict]]:
+    """Load `.curator/merges/.archive/*.json` (already-unmerged origins).
+
+    Used only to recover the pre-federation ``prior_page_same_as``; archived
+    origins are not remaining claimers.
+    """
+    out: list[tuple[str, dict]] = []
+    archive = merges_dir / ".archive"
+    if not archive.is_dir():
+        return out
+    for p in sorted(archive.glob("*.json")):
+        m = _read_manifest_file(p)
+        if m is not None:
+            out.append((p.stem, m))
+    return out
+
+
+def collect_remaining_claims(
+        other_manifests: list[tuple[str, dict]], *,
+        canonical_iri: str | None,
+        canonical_rel: str | None) -> tuple[dict, dict]:
+    """Union remaining origins' ``incoming_same_as`` (apply-order, incoming-wins).
+
+    Returns ``(remaining_map, claimers)`` where ``claimers`` maps
+    ``"auth:id"`` to origin names. Manifests that predate
+    ``incoming_same_as`` are skipped — they are not claimers.
+    """
+    recs: list[tuple[str, str, dict]] = []
+    for origin, m in other_manifests:
+        applied = m.get("applied_at") or ""
+        for r in m.get("identity_reconciliations") or []:
+            if not rec_matches_entity(
+                    r, canonical_iri=canonical_iri,
+                    canonical_rel=canonical_rel):
+                continue
+            inc = r.get("incoming_same_as")
+            if not isinstance(inc, dict):
+                continue
+            recs.append((applied, origin, inc))
+    recs.sort(key=lambda t: t[0])
+    remaining: dict = {}
+    claimers: dict[str, list[str]] = {}
+    for _, origin, inc in recs:
+        remaining = union_same_as(remaining, inc)
+        for k, v in inc.items():
+            key = f"{k}:{v}"
+            claimed = claimers.setdefault(key, [])
+            if origin not in claimed:
+                claimed.append(origin)
+    return remaining, claimers
+
+
+def original_same_as(
+        manifests: list[tuple[str, dict]], *,
+        canonical_iri: str | None,
+        canonical_rel: str | None) -> dict | None:
+    """Earliest ``prior_page_same_as`` for this entity, or None if unknown."""
+    candidates: list[tuple[str, dict]] = []
+    for _, m in manifests:
+        applied = m.get("applied_at") or ""
+        for r in m.get("identity_reconciliations") or []:
+            if not rec_matches_entity(
+                    r, canonical_iri=canonical_iri,
+                    canonical_rel=canonical_rel):
+                continue
+            prior = r.get("prior_page_same_as")
+            if isinstance(prior, dict):
+                candidates.append((applied, prior))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0])
+    return dict(candidates[0][1])
+
+
+def plan_same_as_reversal(
+        *,
+        incoming_same_as: dict,
+        added_same_as: dict | None,
+        current: dict,
+        original: dict | None,
+        remaining: dict,
+        remaining_claimers: dict | None = None) -> dict:
+    """Decide which ``same_as`` pairs to drop, restore, or leave.
+
+    Last-claimer rule, inverse of ``union_same_as`` (incoming-wins):
+
+    For each pair this origin independently claimed (``incoming_same_as``):
+      - live page no longer has that exact k→v → skip (user edit / already gone)
+      - a remaining origin still claims the same k→v → keep
+      - a remaining origin claims a different value for k → restore it
+      - the pre-federation receiver had this k→v → keep
+      - the pre-federation receiver had a different value for k → restore it
+      - otherwise remove (this origin is the last claimer)
+      - original unknown: only remove if ``added_same_as`` shows this
+        origin introduced the pair; otherwise skip (imprecise)
+
+    ``projects:`` / folded wikilinks / page bodies are out of scope.
+    """
+    remaining = remaining or {}
+    current = current or {}
+    incoming_same_as = incoming_same_as or {}
+    claimers = remaining_claimers or {}
+    precise = True
+    remove: dict = {}
+    restore: dict = {}
+    keep_claimed: list[dict] = []
+    keep_original: list[dict] = []
+    skip_user_edit: list[dict] = []
+    skip_imprecise: list[dict] = []
+
+    for k, v in incoming_same_as.items():
+        cur = current.get(k)
+        if cur != v:
+            skip_user_edit.append({
+                "key": k, "incoming": v, "current": cur,
+            })
+            continue
+        rem = remaining.get(k)
+        if rem == v:
+            keep_claimed.append({
+                "key": k, "value": v,
+                "by": list(claimers.get(f"{k}:{v}") or []),
+            })
+            continue
+        if rem is not None:
+            restore[k] = rem
+            continue
+        if original is not None:
+            orig = original.get(k)
+            if orig == v:
+                keep_original.append({"key": k, "value": v})
+            elif orig is not None:
+                restore[k] = orig
+            else:
+                remove[k] = v
+            continue
+        if added_same_as is not None and added_same_as.get(k) == v:
+            remove[k] = v
+        else:
+            precise = False
+            skip_imprecise.append({"key": k, "value": v})
+
+    return {
+        "precise": precise,
+        "remove": remove,
+        "restore": restore,
+        "keep_claimed": keep_claimed,
+        "keep_original": keep_original,
+        "skip_user_edit": skip_user_edit,
+        "skip_imprecise": skip_imprecise,
+    }
+
+
+def apply_same_as_reversal(
+        current: dict, *,
+        incoming_same_as: dict,
+        remove: dict,
+        restore: dict) -> dict:
+    """Apply a reversal plan to a live ``same_as`` map.
+
+    Re-checks the live values so an edit between stage and apply is not
+    clobbered: a remove/restore only fires when ``current[k]`` still
+    equals this origin's incoming value.
+    """
+    new = dict(current or {})
+    incoming_same_as = incoming_same_as or {}
+    for k, v in (remove or {}).items():
+        if new.get(k) == v:
+            del new[k]
+    for k, to_val in (restore or {}).items():
+        if_val = incoming_same_as.get(k)
+        if new.get(k) == if_val:
+            new[k] = to_val
+    return new
