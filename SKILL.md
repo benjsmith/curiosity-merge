@@ -26,9 +26,19 @@ Most curiosity-engine vaults hold sources whose copyright doesn't belong to the 
 `subgraph_export.py --include-vault {none,owned,all}` controls which vault files ride along:
 - `none` (default) — bytes-free export. Wiki pages ship; vault metadata (sha256, source_url, license) is recorded in the manifest; receivers hydrate. **Always safe for public sharing.**
 - `owned` — bundles only files whose frontmatter declares a redistributable license OR whose URL is on a preprint server (arXiv/bioRxiv/chemRxiv).
-- `all` — everything. Personal transfer only; not safe for public sharing.
+- `all` — every vault file **cited by the exported pages**, license notwithstanding. Personal transfer only; not safe for public sharing.
+
+All three modes scope to files the exported pages actually cite — an export is a subgraph, and pulling in uncited vault content would leak sources the shard has no claim to. `all` widens the *licensing* filter, not the scope. Raw originals (the PDF behind an extraction, or the `kept_as` file a structured extraction replays from) are never cited and so never ride along in any mode; they travel out of band — see `hydrate-vault` below.
 
 When a receiver merges, source stubs whose vault files weren't shipped get tagged `vault_missing: true` with provenance. `hydrate_vault.py` walks those stubs, categorizes by URL (arxiv / preprint / open_access / paywalled / unknown), and re-acquires what it can with per-source confirmation. AlphaXiv-preferred for arXiv when installed.
+
+Before any of that it **reconciles what is already there**, because the safe sharing path is a bytes-free export plus an out-of-band source transfer — so a stub is often satisfied by a file the user simply dropped into `vault/`:
+
+- cited file present and its sha256 matches the origin's record → the flag was stale; cleared, recorded `vault_provenance: verbatim`. Citations already resolved.
+- present with **no** recorded sha to check against → cleared as `present-unverified`, so the weaker evidence stays visible.
+- present but sha256 **diverges** → right name, wrong bytes. That is the T3 shape, so it is reported and the stub stays flagged. Never cleared silently.
+
+For a source re-acquired independently (institutional access, a purchased copy), the receiver's extraction is genuinely not the origin's — different bytes, different name. `--adopt PAGE=FILE` ingests it through curiosity-engine and repoints that stub's citations at the extraction this workspace actually holds, using the same citation-rewriting merge already applies when an incoming vault file lands under another name. The stub records `vault_provenance: reacquired` and `vault_reacquired_as`, and **keeps the origin's `vault_sha256`** so the divergence stays auditable rather than being papered over.
 
 **Pre-flight detectors** run on every `subgraph-export` before write: chain-merge contamination (non-native pages excluded by default), quote-density (single-source + page-level thresholds), license-consistency (open-license-on-paywalled-URL warn + restrictive-license-on-OA-URL info), GPL contagion, GDPR-likely PII (regex+density baseline), URL redaction. Each finding has a `severity` (`info`/`warn`/`block`); info-only findings proceed without prompt.
 
@@ -144,9 +154,22 @@ All work is staged to `.curator/.unmerge-staging/<origin>/`. The user reviews th
 ```
 uv run python3 <skill_path>/scripts/hydrate_vault.py --origin <name>
 uv run python3 <skill_path>/scripts/hydrate_vault.py --origin <name> --apply
+uv run python3 <skill_path>/scripts/hydrate_vault.py --apply --adopt sources/smith-2024=~/papers/smith.pdf
 ```
 
-Walks source stubs tagged `vault_missing: true`, categorizes by URL, and dispatches to a fetcher per category. Default is dry-run; `--apply` actually fetches. Per-source confirmation in interactive mode (or `--yes` to auto-accept). Successful fetches clear `vault_missing: true` from the stub.
+Walks source stubs tagged `vault_missing: true` and settles each one of three ways: it is **already satisfied** by a file in `vault/`, it can be **fetched** from its URL, or the receiver **adopts** a copy they acquired themselves. Default is dry-run; `--apply` performs the work. Per-source confirmation in interactive mode (or `--yes` to auto-accept).
+
+**Reconcile runs first, before any network.** Because the safe sharing path is a bytes-free export plus an out-of-band source transfer, the ordinary case is that the cited file is already sitting in `vault/` under the exact name the merged pages cite:
+
+| State | Outcome |
+|---|---|
+| present, sha256 matches the origin's record | flag cleared, `vault_provenance: verbatim` — citations already resolve |
+| present, no recorded sha to verify against | flag cleared, `vault_provenance: present-unverified` |
+| present, sha256 **diverges** | reported, **stub stays flagged** — right name, wrong bytes is the T3 shape |
+
+**`--adopt PAGE=FILE`** (repeatable) handles the re-acquired case: a paywalled paper obtained through institutional access is a different artifact from the origin's extraction — different bytes, different filename — so pointing the merged citations at it is the honest repair. The file is ingested through curiosity-engine, then `(vault:<origin-name>)` is rewritten to the local extraction across every wiki page, the same citation-rewriting merge applies when an incoming vault file lands under another name. The stub records `vault_provenance: reacquired` and `vault_reacquired_as`, and keeps the origin's `vault_sha256` so the divergence stays auditable. `PAGE` is a stem or wiki-relative path; `FILE` is any file curiosity-engine can ingest.
+
+Successful fetches clear `vault_missing: true` and record `vault_provenance: refetched`.
 
 | Category | Strategy |
 |---|---|
@@ -212,6 +235,6 @@ See `docs/trust-model.md` for the full gate list, the rationale for opt-in defau
 | `discover-bridges` + `accept-bridges` | shipped (v0.1) |
 | `merge` (IRI-keyed, shard import, queue, ACL, allow-iris) | shipped (v0.1, vault-missing v0.2, identity v0.6, federation v0.8) |
 | `unmerge` | shipped (v0.1, identity same_as reversal v0.8.2) |
-| `hydrate-vault` | shipped (v0.2) |
+| `hydrate-vault` | shipped (v0.2, reconcile + `--adopt` v0.8.3) |
 
 Each verb is independently shippable; `subgraph-export` is useful immediately even without the other two.

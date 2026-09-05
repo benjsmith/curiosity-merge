@@ -56,7 +56,7 @@ _ce_scripts = os.environ.get("CURIOSITY_ENGINE_SCRIPTS_DIR")
 if _ce_scripts and _ce_scripts not in sys.path:
     sys.path.insert(0, _ce_scripts)
 try:
-    from naming import set_frontmatter_field  # type: ignore
+    from naming import set_frontmatter_field, CITATION_RE  # type: ignore
     from sweep import wiki_pages  # type: ignore
 except ImportError as e:
     sys.stderr.write(f"ERROR: cannot import curiosity-engine helpers ({e})\n")
@@ -218,9 +218,13 @@ def _http_download(url: str, dest: Path, timeout: int = 60) -> bool:
         return False
 
 
-def _local_ingest(workspace: Path, raw_path: Path) -> bool:
-    """Hand a freshly-downloaded raw file to curiosity-engine's
-    local_ingest.py so it lands in the vault with proper frontmatter.
+def _local_ingest(workspace: Path, raw_path: Path) -> Optional[str]:
+    """Hand a raw file to curiosity-engine's local_ingest.py so it lands in
+    the vault with proper frontmatter.
+
+    Returns the produced extraction's vault-relative name, or None on
+    failure. Adoption needs the name: the receiver's extraction is not the
+    origin's, so citations have to be pointed at what was actually created.
     """
     li = Path(_ce_scripts or "") / "local_ingest.py" if _ce_scripts else None
     if not li or not li.is_file():
@@ -228,9 +232,12 @@ def _local_ingest(workspace: Path, raw_path: Path) -> bool:
             "hydrate-vault: local_ingest.py not found; "
             "set CURIOSITY_ENGINE_SCRIPTS_DIR.\n"
         )
-        return False
+        return None
+    # `--file`, not a bare positional: local_ingest's positional argument is
+    # a *directory*, so passing a file there fails with "not a directory"
+    # and every fetch path silently ended in a failed ingest.
     res = subprocess.run(
-        ["uv", "run", "python3", str(li), str(raw_path)],
+        ["uv", "run", "python3", str(li), "--file", str(raw_path)],
         cwd=str(workspace), capture_output=True, text=True,
     )
     if res.returncode != 0:
@@ -238,7 +245,21 @@ def _local_ingest(workspace: Path, raw_path: Path) -> bool:
             f"hydrate-vault: local_ingest failed for {raw_path}: "
             f"{res.stderr[:300]}\n"
         )
-    return res.returncode == 0
+        return None
+    try:
+        results = json.loads(res.stdout).get("results") or []
+        extracted = results[0].get("extracted") if results else None
+    except (ValueError, AttributeError, IndexError):
+        extracted = None
+    if not extracted:
+        sys.stderr.write(
+            f"hydrate-vault: local_ingest reported no extraction for "
+            f"{raw_path}\n"
+        )
+        return None
+    # `extracted` is workspace-relative ("vault/<name>"); citations are
+    # vault-relative.
+    return Path(extracted).name
 
 
 def _sha256_file(path: Path) -> str:
@@ -250,6 +271,80 @@ def _sha256_file(path: Path) -> str:
 
 
 # --- the main flow --------------------------------------------------------
+
+
+def _cited_vault_rel(text: str) -> str:
+    """The vault file a source stub cites. First citation wins, matching
+    how merge.py picks the representative citation when tagging."""
+    m = CITATION_RE.search(text)
+    return m.group(1).strip() if m else ""
+
+
+def _safe_vault_path(vault: Path, rel: str) -> Optional[Path]:
+    """Resolve a citation target inside vault/, refusing traversal."""
+    if not rel or Path(rel).is_absolute() or ".." in Path(rel).parts:
+        return None
+    target = (vault / rel).resolve()
+    try:
+        target.relative_to(vault.resolve())
+    except ValueError:
+        return None
+    return target
+
+
+def _rewrite_citations_in_wiki(wiki: Path, old_rel: str, new_rel: str) -> int:
+    """Point `(vault:old_rel)` at `new_rel` across every wiki page.
+
+    Mirrors merge.py's `_rewrite_citations`, which is how this codebase
+    already expresses "that citation resolves to a different file" when an
+    incoming vault file lands under another name in the receiver.
+    """
+    if old_rel == new_rel:
+        return 0
+    changed = 0
+    for page in wiki_pages(wiki):
+        text = page.read_text(errors="replace")
+
+        def repl(m, _old=old_rel, _new=new_rel):
+            return (f"(vault:{_new})" if m.group(1).strip() == _old
+                    else m.group(0))
+
+        rewritten = CITATION_RE.sub(repl, text)
+        if rewritten != text:
+            page.write_text(rewritten)
+            changed += 1
+    return changed
+
+
+def _reconcile(workspace: Path, items: list[dict]) -> tuple[list, list, list]:
+    """Adopt sources the user transferred separately and dropped in vault.
+
+    The documented sharing path is a bytes-free export plus a separate
+    source transfer, so the ordinary case is that the origin's own
+    extraction is now sitting in vault/ under exactly the name the merged
+    pages already cite. Nothing needs fetching or rewriting — the stub is
+    simply stale.
+
+    Returns (verbatim, unverified, divergent).
+    """
+    vault = workspace / "vault"
+    verbatim: list[dict] = []
+    unverified: list[dict] = []
+    divergent: list[tuple[dict, str]] = []
+    for item in items:
+        target = _safe_vault_path(vault, item.get("citation_rel", ""))
+        if target is None or not target.is_file():
+            continue
+        recorded = (item.get("vault_sha256") or "").strip()
+        actual = _sha256_file(target)
+        if not recorded:
+            unverified.append(item)
+        elif actual == recorded:
+            verbatim.append(item)
+        else:
+            # T3 surface: right name, wrong bytes. Never cleared silently.
+            divergent.append((item, actual))
+    return verbatim, unverified, divergent
 
 
 def _collect_missing(workspace: Path, origin_filter: str | None) -> list[dict]:
@@ -270,6 +365,7 @@ def _collect_missing(workspace: Path, origin_filter: str | None) -> list[dict]:
         out.append({
             "page": p,
             "page_rel": str(p.relative_to(wiki)),
+            "citation_rel": _cited_vault_rel(text),
             "source_url": fm.get("source_url", ""),
             "source_type": fm.get("source_type", ""),
             "license": fm.get("license", ""),
@@ -301,7 +397,7 @@ def _process_arxiv(workspace: Path, item: dict, *, alphaxiv_dir: Optional[Path],
             return False, "user declined alphaxiv"
         produced = _alphaxiv_fetch(arxiv_id, alphaxiv_dir, work_dir)
         if produced and produced.is_file():
-            ok = _local_ingest(workspace, produced)
+            ok = _local_ingest(workspace, produced) is not None
             return ok, ("ingested via alphaxiv" if ok
                         else "alphaxiv fetched but local_ingest failed")
         # fall through to PDF on alphaxiv miss
@@ -312,7 +408,7 @@ def _process_arxiv(workspace: Path, item: dict, *, alphaxiv_dir: Optional[Path],
     raw = work_dir / f"{arxiv_id}.pdf"
     if not _http_download(_arxiv_pdf_url(arxiv_id), raw):
         return False, "download failed"
-    ok = _local_ingest(workspace, raw)
+    ok = _local_ingest(workspace, raw) is not None
     return ok, ("ingested via PDF" if ok else "local_ingest failed")
 
 
@@ -329,8 +425,103 @@ def _process_preprint_pdf(workspace: Path, item: dict, *, yes: bool,
     raw = work_dir / name
     if not _http_download(url, raw):
         return False, "download failed"
-    ok = _local_ingest(workspace, raw)
+    ok = _local_ingest(workspace, raw) is not None
     return ok, ("ingested" if ok else "local_ingest failed")
+
+
+def _clear_missing(page: Path, provenance: str,
+                   extra: Optional[dict] = None) -> None:
+    """Drop `vault_missing` and record how the source was recovered.
+
+    `vault_sha256` is deliberately left alone: it is the origin's hash, and
+    keeping it next to a `reacquired` provenance is what makes the
+    divergence auditable rather than erased.
+    """
+    text = page.read_text(errors="replace")
+    text = set_frontmatter_field(text, "vault_missing", None)
+    text = set_frontmatter_field(text, "vault_provenance", provenance)
+    for key, value in (extra or {}).items():
+        text = set_frontmatter_field(text, key, value)
+    page.write_text(text)
+
+
+def _repoint_sources(page: Path, old_rel: str, new_rel: str) -> None:
+    """Keep the stub's `sources:` list pointing at the file it now cites."""
+    text = page.read_text(errors="replace")
+    current = _raw_frontmatter(text).get("sources", "")
+    if old_rel and old_rel in current:
+        page.write_text(
+            set_frontmatter_field(text, "sources",
+                                  current.replace(old_rel, new_rel))
+        )
+
+
+def _match_page(items: list[dict], ref: str) -> Optional[dict]:
+    """Resolve an --adopt page reference against collected stubs.
+
+    Accepts a bare stem ('smith-2024') or a wiki-relative path with or
+    without .md ('sources/smith-2024'). Case-insensitive, like the page
+    refs subgraph_export already accepts.
+    """
+    want = ref.strip().lower().removesuffix(".md").replace("\\", "/")
+    for item in items:
+        rel = item["page_rel"].lower().removesuffix(".md")
+        if want in (rel, Path(rel).name):
+            return item
+    return None
+
+
+def _resolve_adoptions(specs: list[str], items: list[dict]
+                       ) -> tuple[list[tuple[dict, Path]], list[str]]:
+    plan: list[tuple[dict, Path]] = []
+    errors: list[str] = []
+    for spec in specs:
+        if "=" not in spec:
+            errors.append(f"{spec!r}: expected PAGE=FILE")
+            continue
+        ref, _, raw = spec.partition("=")
+        item = _match_page(items, ref)
+        if item is None:
+            errors.append(f"{ref!r}: no vault_missing stub matches")
+            continue
+        if any(item is chosen for chosen, _ in plan):
+            errors.append(f"{ref!r}: adopted more than once")
+            continue
+        path = Path(raw).expanduser()
+        if not path.is_file():
+            errors.append(f"{ref!r}: no such file: {path}")
+            continue
+        plan.append((item, path))
+    return plan, errors
+
+
+def _process_adopt(workspace: Path, item: dict, raw_path: Path, *,
+                   yes: bool) -> tuple[bool, str]:
+    """Adopt a source the receiver re-acquired independently.
+
+    Their extraction is not the origin's — different bytes, different
+    name — so the honest repair is to point the merged citations at the
+    file this workspace actually holds, exactly as merge.py repoints
+    citations when an incoming vault file lands under another name.
+    """
+    origin_rel = item.get("citation_rel", "")
+    if not origin_rel:
+        return False, "stub cites no vault file to repoint"
+    if not _confirm(
+        f"  ingest {raw_path.name} and repoint citations for "
+        f"{item['page_rel']}?", yes=yes
+    ):
+        return False, "user declined"
+    new_rel = _local_ingest(workspace, raw_path)
+    if not new_rel:
+        return False, "local_ingest failed"
+    pages = _rewrite_citations_in_wiki(workspace / "wiki", origin_rel, new_rel)
+    _repoint_sources(item["page"], origin_rel, new_rel)
+    _clear_missing(item["page"], "reacquired", {
+        "vault_reacquired_as": new_rel,
+        "vault_reacquired_sha256": _sha256_file(workspace / "vault" / new_rel),
+    })
+    return True, f"ingested as {new_rel}; repointed {pages} page(s)"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -346,6 +537,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="actually fetch (default: dry-run report only)")
     ap.add_argument("--yes", action="store_true",
                     help="auto-accept per-source confirmations")
+    ap.add_argument("--adopt", action="append", metavar="PAGE=FILE",
+                    help="adopt a source you re-acquired yourself: ingest "
+                         "FILE and repoint the stub's citations at the "
+                         "extraction this workspace produces. Repeatable.")
     ap.add_argument("--offer-alphaxiv", action="store_true",
                     help="print alphaxiv install hint when arXiv items "
                          "fell back to PDF (default: silent)")
@@ -357,11 +552,33 @@ def main(argv: list[str] | None = None) -> int:
 
     missing = _collect_missing(workspace, args.origin)
     if not missing:
+        if args.adopt:
+            sys.stderr.write(
+                "hydrate-vault: --adopt given but no vault_missing stubs "
+                "to adopt into.\n"
+            )
+            return 2
         sys.stdout.write("hydrate-vault: no vault_missing stubs to process.\n")
         return 0
 
+    # Separately-transferred sources come first: the documented sharing path
+    # is a bytes-free export plus an out-of-band source transfer, so a stub
+    # may already be satisfied by a file the user dropped into vault/.
+    # Checking costs nothing and avoids re-fetching what is already here.
+    verbatim, unverified, divergent = _reconcile(workspace, missing)
+
+    adopt_plan, adopt_errors = _resolve_adoptions(args.adopt or [], missing)
+    for err in adopt_errors:
+        sys.stderr.write(f"hydrate-vault: --adopt {err}\n")
+    if adopt_errors:
+        return 2
+
+    settled = {id(m) for m in verbatim + unverified}
+    settled |= {id(m) for m, _ in adopt_plan}
+    remaining = [m for m in missing if id(m) not in settled]
+
     buckets: dict[str, list[dict]] = {}
-    for m in missing:
+    for m in remaining:
         cat = _categorize(m["source_url"], m["license"])
         buckets.setdefault(cat, []).append(m)
 
@@ -370,6 +587,29 @@ def main(argv: list[str] | None = None) -> int:
         + (f" (origin filter: {args.origin})" if args.origin else "")
         + "\n"
     )
+    for label, group in (("already in vault (verbatim, sha verified)", verbatim),
+                         ("already in vault (no recorded sha to verify)",
+                          unverified)):
+        if group:
+            sys.stdout.write(f"\n{len(group)} {label}:\n")
+            for m in group:
+                sys.stdout.write(f"- {m['page_rel']} → {m['citation_rel']}\n")
+    if divergent:
+        sys.stdout.write(
+            f"\n{len(divergent)} present but sha256 DIVERGENT "
+            "(kept flagged; verify before trusting):\n"
+        )
+        for m, actual in divergent:
+            sys.stdout.write(
+                f"- {m['page_rel']} → {m['citation_rel']}\n"
+                f"    recorded {m['vault_sha256'][:16]}… "
+                f"actual {actual[:16]}…\n"
+            )
+    if adopt_plan:
+        sys.stdout.write(f"\n{len(adopt_plan)} to adopt:\n")
+        for m, path in adopt_plan:
+            sys.stdout.write(f"- {m['page_rel']} ← {path}\n")
+
     for cat in ("arxiv", "biorxiv", "chemrxiv", "open_access",
                 "paywalled", "unknown"):
         items = buckets.get(cat, [])
@@ -380,7 +620,8 @@ def main(argv: list[str] | None = None) -> int:
     alphaxiv_dir = _find_alphaxiv()
     if not args.apply:
         sys.stdout.write(
-            "\n(dry run — pass --apply to actually fetch)\n"
+            "\n(dry run — pass --apply to fetch, adopt, and clear "
+            "recovered flags)\n"
         )
         if alphaxiv_dir is None and buckets.get("arxiv"):
             sys.stdout.write(
@@ -402,6 +643,29 @@ def main(argv: list[str] | None = None) -> int:
     failed: list[tuple[str, str]] = []
     skipped: list[tuple[str, str]] = []
     fell_back_to_pdf = 0
+
+    # Already satisfied out of band: clear the stale flag, record how we
+    # know. No network, no rewriting — the cited name already resolves.
+    for m in verbatim:
+        _clear_missing(m["page"], "verbatim")
+        succeeded.append(m["page_rel"])
+    for m in unverified:
+        _clear_missing(m["page"], "present-unverified")
+        succeeded.append(m["page_rel"])
+    for m, actual in divergent:
+        skipped.append((
+            m["page_rel"],
+            f"present but sha256 diverges from the origin's record "
+            f"(recorded {m['vault_sha256'][:16]}…, actual {actual[:16]}…)",
+        ))
+
+    for m, path in adopt_plan:
+        sys.stdout.write(f"\n→ adopt: {m['page_rel']} ← {path}\n")
+        ok, why = _process_adopt(workspace, m, path, yes=args.yes)
+        if ok:
+            sys.stdout.write(f"  {why}\n")
+        else:
+            (failed if "failed" in why else skipped).append((m["page_rel"], why))
 
     for m in buckets.get("arxiv", []):
         sys.stdout.write(f"\n→ arXiv: {m['page_rel']}\n")
@@ -444,12 +708,16 @@ def main(argv: list[str] | None = None) -> int:
              "no recognized source_url; manual handling required")
         )
 
-    # Drop vault_missing flag on stubs whose fetch succeeded.
+    # Drop vault_missing on stubs whose fetch succeeded. Reconciled and
+    # adopted stubs already recorded their own provenance above.
+    handled = {m["page_rel"] for m in verbatim + unverified}
+    handled |= {m["page_rel"] for m, _ in adopt_plan}
     for rel in succeeded:
+        if rel in handled:
+            continue
         page = workspace / "wiki" / rel
         if page.is_file():
-            text = page.read_text(errors="replace")
-            page.write_text(set_frontmatter_field(text, "vault_missing", None))
+            _clear_missing(page, "refetched")
 
     # Cleanup
     if work_dir.is_dir() and not any(work_dir.iterdir()):

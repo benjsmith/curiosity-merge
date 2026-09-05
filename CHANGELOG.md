@@ -1,5 +1,79 @@
 # Changelog
 
+## v0.8.3 — 2026-09-05
+
+Closes the receiving half of the out-of-band source contract, and fixes a
+bug that made `hydrate-vault --apply` incapable of succeeding.
+
+### `hydrate-vault --apply` could never succeed (bug)
+
+`_local_ingest` invoked curiosity-engine's `local_ingest.py` with the raw
+file as a **positional** argument. That positional is a *directory*, so
+every call returned `not a directory` and every fetch path — arXiv,
+bioRxiv/chemRxiv, open-access — ended in a failed ingest after a
+successful download. It now passes `--file`.
+
+This was invisible because no test exercised `--apply`; the two existing
+hydrate tests covered dry-run categorization only. Verified against
+curiosity-engine v1.5.0 and v1.6.1: the failure was identical on both, so
+it predates the structured-dataset release.
+
+`_local_ingest` now also returns the produced extraction's vault-relative
+name rather than a bool, which is what makes adoption possible.
+
+### Recovering links when sources travel separately
+
+The safe sharing path is a bytes-free export plus an out-of-band source
+transfer (`docs/trust-model.md` § Licensing). The publishing side of that
+was implemented; the receiving side was not — nothing ever noticed that a
+source had arrived, so stubs stayed `vault_missing: true` forever and
+their citations never resolved.
+
+`hydrate-vault` now **reconciles before it fetches**:
+
+| State of the cited file | Outcome |
+|---|---|
+| present, sha256 matches the origin's record | flag cleared, `vault_provenance: verbatim` |
+| present, no recorded sha to verify | flag cleared, `vault_provenance: present-unverified` |
+| present, sha256 diverges | reported; **stub stays flagged** |
+
+The divergent case is deliberate: right name with wrong bytes is threat
+T3, not a hydration success, so it is surfaced rather than cleared.
+
+### `--adopt PAGE=FILE` for independently re-acquired sources
+
+A paywalled paper obtained through institutional access is a different
+artifact from the origin's extraction — different bytes, different
+filename — so no sha check can ever pass. Adoption ingests the receiver's
+copy through curiosity-engine and repoints `(vault:<origin-name>)` at the
+local extraction across every wiki page, reusing the citation-rewriting
+convention `merge.py` already applies when an incoming vault file lands
+under another name.
+
+The stub records `vault_provenance: reacquired` and
+`vault_reacquired_as`, and **keeps the origin's `vault_sha256`**. Nothing
+is overwritten to make the graph look whole: the divergence stays
+auditable. Repeatable, and a no-op in dry-run.
+
+### `--include-vault all` documented accurately
+
+The docs said "everything"; the implementation ships only vault files the
+exported pages actually **cite**. The implementation is right — an export
+is a subgraph, and pulling in uncited vault content would leak sources the
+shard has no claim to — so the docs were corrected. `all` widens the
+*licensing* filter, not the scope.
+
+Stated explicitly for the first time: raw originals (the PDF behind an
+extraction, or the `kept_as` file a curiosity-engine v1.6 structured
+extraction replays from) are never cited, so they ride along in no mode.
+They travel out of band, which is what the reconcile path above is for.
+
+### Tests
+
+Three added, all offline: verbatim reconcile, refusal to clear on sha
+divergence, and adoption repointing every citing page (with a dry-run
+no-mutation assertion). 207 pass.
+
 ## v0.8.2 — 2026-09-01
 
 Unmerge now reverses identity `same_as` unions, including the multi-origin overlap the v0.6.0 plan left out of scope.

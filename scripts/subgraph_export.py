@@ -729,7 +729,8 @@ def main(argv: list[str] | None = None) -> int:
                          "vault file so receivers can hydrate). 'owned' = "
                          "files whose frontmatter declares a redistributable "
                          "license or arXiv-family preprint URL. 'all' = "
-                         "include everything (only safe for personal "
+                         "every cited vault file, license notwithstanding "
+                         "(only safe for personal "
                          "transfer, not public sharing).")
     ap.add_argument("--include-non-native", action="store_true",
                     help="ship pages whose `origin:` tag indicates they "

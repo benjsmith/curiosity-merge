@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -2153,3 +2154,122 @@ def test_rerun_gates_refreshes_audit_without_redoing_reconciliation(
                     "## Page-name collisions",
                     "## Quarantined"):
         assert section in audit_after
+
+
+# --- hydrate-vault recovery of separately-transferred sources -------------
+#
+# The documented sharing path is a bytes-free export plus an out-of-band
+# source transfer (docs/trust-model.md § Licensing). These cover the other
+# half of that contract: that the merged graph actually recovers its links
+# once the sources arrive.
+
+
+def _merged_with_missing(source_wiki: Path, receiver: Path, env, tmp_path,
+                         keep: str):
+    """Export bytes-free, merge, apply — leaving vault_missing stubs.
+
+    Only `keep`'s stub stays flagged; the rest are stood down so these
+    tests exercise recovery offline, without the fetch categories
+    reaching for the network.
+    """
+    export = tmp_path / "shared-recovery"
+    run_script("subgraph_export.py", "--project", "mixed", "--to", str(export),
+               "--workspace", str(source_wiki), env=env)
+    run_script("merge.py", str(export), "--as-origin", "shared",
+               "--workspace", str(receiver), env=env)
+    run_script("merge.py", "--apply", "shared",
+               "--workspace", str(receiver), env=env)
+    stubs = {}
+    for page in (receiver / "wiki").rglob("*.md"):
+        text = page.read_text()
+        if "vault_missing: true" not in text:
+            continue
+        m = re.search(r"\(vault:([^)]+)\)", text)
+        if not m:
+            continue
+        cited = m.group(1).strip()
+        if cited == keep:
+            stubs[cited] = page
+        else:
+            page.write_text(text.replace("vault_missing: true",
+                                         "vault_missing: false"))
+    return stubs
+
+
+def test_hydrate_reconciles_verbatim_dropped_source(
+        wiki_a_with_paywalled: Path, wiki_a: Path, env_with_ce, tmp_path):
+    """The origin's own extraction, transferred out of band and dropped into
+    vault/, satisfies the stub — no fetch, no rewriting."""
+    cited = "nature-paper.extracted.md"
+    stubs = _merged_with_missing(wiki_a_with_paywalled, wiki_a,
+                                 env_with_ce, tmp_path, keep=cited)
+    assert cited in stubs, sorted(stubs)
+    # The user receives the source separately and drops it in.
+    shutil.copy2(wiki_a_with_paywalled / "vault" / cited,
+                 wiki_a / "vault" / cited)
+
+    res = run_script("hydrate_vault.py", "--workspace", str(wiki_a),
+                     "--apply", "--yes", env=env_with_ce)
+    assert "verbatim, sha verified" in res.stdout, res.stdout
+    text = stubs[cited].read_text()
+    assert "vault_missing" not in text
+    assert "vault_provenance: verbatim" in text
+
+
+def test_hydrate_refuses_to_clear_on_sha_divergence(
+        wiki_a_with_paywalled: Path, wiki_a: Path, env_with_ce, tmp_path):
+    """Right name, wrong bytes is the T3 shape: surfaced, never cleared."""
+    cited = "nature-paper.extracted.md"
+    stubs = _merged_with_missing(wiki_a_with_paywalled, wiki_a,
+                                 env_with_ce, tmp_path, keep=cited)
+    (wiki_a / "vault" / cited).write_text(
+        "---\ntitle: Not the same document\n---\n\nSubstituted content.\n"
+    )
+    res = run_script("hydrate_vault.py", "--workspace", str(wiki_a),
+                     "--apply", "--yes", env=env_with_ce)
+    assert "DIVERGENT" in res.stdout, res.stdout
+    assert "vault_missing: true" in stubs[cited].read_text()
+
+
+def test_hydrate_adopt_repoints_citations_to_local_extraction(
+        wiki_a_with_paywalled: Path, wiki_a: Path, env_with_ce, tmp_path):
+    """A re-acquired source is ingested locally and the merged citations are
+    repointed at the extraction this workspace actually holds."""
+    cited = "nature-paper.extracted.md"
+    stubs = _merged_with_missing(wiki_a_with_paywalled, wiki_a,
+                                 env_with_ce, tmp_path, keep=cited)
+    stub = stubs[cited]
+    # Pages other than the stub cite the same vault file; all must move.
+    citing_before = [p for p in (wiki_a / "wiki").rglob("*.md")
+                     if f"(vault:{cited})" in p.read_text()]
+    assert len(citing_before) >= 2, [p.name for p in citing_before]
+
+    reacquired = tmp_path / "nature-reacquired.txt"
+    reacquired.write_text("Independently re-acquired copy of the paper.\n")
+
+    # Dry run plans the adoption without touching anything.
+    before = stub.read_text()
+    dry = run_script("hydrate_vault.py", "--workspace", str(wiki_a),
+                     "--adopt", f"{stub.stem}={reacquired}", env=env_with_ce)
+    assert "to adopt" in dry.stdout
+    assert stub.read_text() == before
+    assert not list((wiki_a / "vault").glob("*local-nature-reacquired*"))
+
+    res = run_script(
+        "hydrate_vault.py", "--workspace", str(wiki_a), "--apply", "--yes",
+        "--adopt", f"{stub.stem}={reacquired}", env=env_with_ce,
+    )
+    assert "repointed" in res.stdout, res.stdout
+
+    text = stub.read_text()
+    assert "vault_missing" not in text
+    assert "vault_provenance: reacquired" in text
+    # The origin's hash is kept so the divergence stays auditable.
+    assert "vault_sha256:" in text
+    new_rel = re.search(r"vault_reacquired_as: (\S+)", text).group(1)
+    assert (wiki_a / "vault" / new_rel).is_file()
+    # No page still cites the origin's name; every one of them moved.
+    for page in (wiki_a / "wiki").rglob("*.md"):
+        assert f"(vault:{cited})" not in page.read_text(), page.name
+    assert any(f"(vault:{new_rel})" in p.read_text()
+               for p in (wiki_a / "wiki").rglob("*.md"))
