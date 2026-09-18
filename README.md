@@ -14,14 +14,42 @@ This is a separate skill (not part of curiosity-engine) because it ingests exter
 
 ## Install
 
-Requires curiosity-engine to be installed in the same workspace.
+The supported install is a **bare skill install** alongside an existing
+[curiosity-engine](https://github.com/benjsmith/curiosity-engine) workspace.
+For the Switchbay and okbay integration pins, use curiosity-merge **v0.8.3**
+(commit `4a533425f39a56bb23668a5d3831bf4df64fa0e8`). The exact consumer
+contract is in [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md).
 
 ```bash
+# Convenience install (latest published skill; pin the tag/SHA in a product installer).
 npx skills add -g -y benjsmith/curiosity-merge
+
+# Run from the target curiosity-engine workspace.
 bash <skill_path>/scripts/setup.sh
 ```
 
-`setup.sh` checks for curiosity-engine and refuses to proceed without it.
+`setup.sh` takes no positional arguments. Its input is the current workspace,
+plus the optional `CURIOSITY_ENGINE_SCRIPTS_DIR` override. It requires `git`,
+Python 3.9+, `uv`, and a curiosity-engine `scripts/` directory containing
+`naming.py` and `sweep.py`; it refuses to continue when those prerequisites are
+missing. It writes `.curator/.curiosity-merge-env` in the workspace and
+`~/.config/curiosity-merge/env`, and prints the host allowlist patterns needed
+for this skill. It does not install a daemon, open a port, or modify wiki/vault
+content. Optional alphaxiv and Presidio installs are prompted only in an
+interactive terminal and are not required for the core skill.
+
+`setup.sh` cannot modify the caller's environment. Source the generated
+workspace env file (or export `CURIOSITY_ENGINE_SCRIPTS_DIR`) before invoking a
+script. For CI or a product installer, set
+`CURIOSITY_MERGE_NONINTERACTIVE=1` to suppress optional prompts.
+
+### Product UI boundary
+
+curiosity-merge (CM) owns **no product UI**: no PWA, QML, HTML, rail, tabs,
+settings screen, daemon, reverse proxy, or model/harness registry. It owns the
+merge and sanitization skill and produces filesystem artifacts, staging trees,
+manifests, audit reports, and exit codes. Switchbay and okbay own their UI and
+invoke CM as a headless dependency; they must not copy CM UI into their shells.
 
 ## Usage
 
@@ -75,7 +103,8 @@ curiosity-merge/
 │   ├── architecture.md
 │   ├── trust-model.md
 │   ├── licensing.md
-│   └── publishing.md
+│   ├── publishing.md
+│   └── INSTALLER-CONTRACT.md      # bare, Switchbay, and okbay install contract
 ├── scripts/
 │   ├── setup.sh
 │   ├── subgraph_export.py

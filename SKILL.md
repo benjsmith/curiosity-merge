@@ -9,15 +9,44 @@ Cross-wiki operations for [curiosity-engine](https://github.com/benjsmith/curios
 
 This is a deliberately separate skill because it ingests external data (someone else's wiki). The trust model is different from daily curation, the audience is smaller, and the release cadence is independent.
 
-## Dependency
+## Install contract
 
-Requires `curiosity-engine` installed in the same workspace. `setup.sh` verifies this and refuses to proceed if it's missing. Scripts import shared helpers via the `CURIOSITY_ENGINE_SCRIPTS_DIR` env var (or `<skill_path>` substitution under Claude Code).
+CM is a headless skill installed alongside `curiosity-engine` in the target
+workspace. The supported installer is `scripts/setup.sh`; it takes no
+positional arguments and uses the current directory as its workspace. Set
+`CURIOSITY_ENGINE_SCRIPTS_DIR` to override helper discovery, or let setup find
+a sibling/user skill install. The installer requires `git`, Python 3.9+, `uv`,
+and a valid curiosity-engine `scripts/` directory containing `naming.py` and
+`sweep.py`.
 
 ```bash
-# install (alongside an existing curiosity-engine install)
 npx skills add -g -y benjsmith/curiosity-merge
 bash <skill_path>/scripts/setup.sh
 ```
+
+Setup outputs `.curator/.curiosity-merge-env`,
+`~/.config/curiosity-merge/env`, and auditable host allowlist patterns on
+stdout. It does not mutate wiki/vault content, start a service, open a port,
+or install product UI. It cannot export variables into the calling shell:
+source the workspace env file before running a CM script. Product installers
+and CI should set `CURIOSITY_MERGE_NONINTERACTIVE=1` to skip optional prompts.
+See [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md) for the
+Switchbay/okbay pins and release-bump procedure.
+
+**Phase 3 integration pin:** CM `v0.8.3`
+(`4a533425f39a56bb23668a5d3831bf4df64fa0e8`). The corresponding
+curiosity-engine pin for the Switchbay/okbay integration pair is `v1.8.2`
+(`f80d7689572afdeac7548792a45691db544c4863`). Consumers must pin both tag and
+commit; an unqualified branch or “latest” is not a release pin.
+
+## Product UI boundary
+
+curiosity-merge owns the merge + sanitization skill only. It owns **no product
+UI** and must not grow a PWA, QML/HTML surface, rail, tabs, settings screen,
+daemon, reverse proxy, or model/harness registry. Switchbay and okbay own
+those surfaces and invoke CM headlessly. CM returns exit status and writes
+staging trees, manifests, audit reports, and wiki/vault artifacts for the host
+to present; it does not render or serve them.
 
 ## Sharing and licensing — share notes, not sources
 
