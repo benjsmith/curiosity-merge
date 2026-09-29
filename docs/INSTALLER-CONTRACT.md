@@ -19,7 +19,7 @@ a floating branch.
 | Component | Phase 3 pin | Commit | Consumers |
 |---|---|---|---|
 | curiosity-engine | `v1.9.0` (**pending tag**) | `301858011097d6811801785380d056ecdd158dc9` (origin/main tip at docs cut) | Switchbay, okbay, bare CM dependency |
-| curiosity-merge | `v0.8.4` (**pending tag**; this release) | a644350e25e4e19cf1a9bac28392f8e22bb33801 | Switchbay and okbay |
+| curiosity-merge | `v0.8.4` (**pending tag**; this release) | tip of `docs/release-v0.8.4` / [PR #3](https://github.com/benjsmith/curiosity-merge/pull/3) until merge to main | Switchbay and okbay |
 | switchbay (consumer) | `v0.13.0` (**pending**) | — | Records CE+CM pins in its release metadata |
 
 These are the current integration pins, not a promise that every CM command
