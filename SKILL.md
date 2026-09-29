@@ -33,11 +33,12 @@ and CI should set `CURIOSITY_MERGE_NONINTERACTIVE=1` to skip optional prompts.
 See [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md) for the
 Switchbay/okbay pins and release-bump procedure.
 
-**Phase 3 integration pin:** CM `v0.8.3`
-(`4a533425f39a56bb23668a5d3831bf4df64fa0e8`). The corresponding
-curiosity-engine pin for the Switchbay/okbay integration pair is `v1.8.2`
-(`f80d7689572afdeac7548792a45691db544c4863`). Consumers must pin both tag and
-commit; an unqualified branch or “latest” is not a release pin.
+**Phase 3 integration pin:** CM `v0.8.4` (tag pending; this release). The
+corresponding curiosity-engine pin for the Switchbay/okbay integration pair is
+`v1.9.0` (**pending tag**; tip `301858011097d6811801785380d056ecdd158dc9`). Until CE is tagged, record
+“pending CE v1.9.0” at that tip consistently. Consumers must pin both tag and
+commit once cut; an unqualified branch or “latest” is not a release pin.
+Switchbay consumer release: **v0.13.0** (pending).
 
 ## Product UI boundary
 

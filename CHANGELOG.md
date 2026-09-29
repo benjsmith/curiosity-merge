@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.8.4 — 2026-09-29
+
+**Migration:** none. **Breaking:** none.
+
+Documents the **Phase 3 installer / UI-boundary contract** that already landed
+on `main` (`docs/INSTALLER-CONTRACT.md`) and reconciles integration **pin
+tables** with the upcoming skill-shell release wave:
+
+| Component | Pin | Notes |
+|---|---|---|
+| curiosity-merge | **v0.8.4** (this release) | Docs + pin bump only |
+| curiosity-engine | **v1.9.0** (pending tag) | Code tip `3018580` (`301858011097d6811801785380d056ecdd158dc9`); CE docs PR open for release notes |
+| Switchbay | **v0.13.0** (pending) | Consumer of CE/CM/okstratr embeds — record when SB tags |
+
+### Clarified
+
+- **Installer contract:** bare-skill, Switchbay, and okbay install CM headlessly
+  via `scripts/setup.sh`; pins are tag **and** full commit; no floating
+  `main`/`latest` production pins.
+- **UI boundary:** CM owns **no** product UI (no PWA/QML/HTML/rail/tabs/
+  settings/daemon/proxy/registry). Shells present CM artifacts; CM returns
+  exit status + filesystem outputs.
+- Pin table previously froze CE at `v1.8.2` / CM at `v0.8.3`; product installers
+  should move to the pair above once CE **v1.9.0** and CM **v0.8.4** are tagged.
+  Until CE is tagged, record “pending CE v1.9.0” at tip `3018580` consistently.
+
+### Unchanged
+
+- Runtime merge/export/hydrate behavior (still v0.8.3 semantics).
+- `docs/architecture.md` federation layout (no contradiction with Phase 3).
+
 ## v0.8.3 — 2026-09-05
 
 Closes the receiving half of the out-of-band source contract, and fixes a

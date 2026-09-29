@@ -1,6 +1,6 @@
 # Installer contract
 
-**Status:** Phase 3 contract, locked 2026-09-18  
+**Status:** Phase 3 contract, locked 2026-09-18 (pins refreshed 2026-09-29 for v0.8.4)  
 **Owner:** curiosity-merge (CM)  
 **Scope:** bare-skill, Switchbay, and okbay installation
 
@@ -18,8 +18,9 @@ a floating branch.
 
 | Component | Phase 3 pin | Commit | Consumers |
 |---|---|---|---|
-| curiosity-engine | `v1.8.2` | `f80d7689572afdeac7548792a45691db544c4863` | Switchbay, okbay, bare CM dependency |
-| curiosity-merge | `v0.8.3` | `4a533425f39a56bb23668a5d3831bf4df64fa0e8` | Switchbay and okbay |
+| curiosity-engine | `v1.9.0` (**pending tag**) | `301858011097d6811801785380d056ecdd158dc9` (origin/main tip at docs cut) | Switchbay, okbay, bare CM dependency |
+| curiosity-merge | `v0.8.4` (**pending tag**; this release) | 4f8ed5500c33fdc92560c612ec4b12fd7ff5307c | Switchbay and okbay |
+| switchbay (consumer) | `v0.13.0` (**pending**) | — | Records CE+CM pins in its release metadata |
 
 These are the current integration pins, not a promise that every CM command
 requires this exact curiosity-engine release. CM imports curiosity-engine
@@ -115,7 +116,10 @@ source .curator/.curiosity-merge-env
 uv run python3 <skill_path>/scripts/preflight.py --help
 ```
 
-For reproducible bare-skill deployments, resolve the CM source to `v0.8.3`
-and `4a533425f39a56bb23668a5d3831bf4df64fa0e8` and install the matching CE
-pin. The final `preflight.py --help` invocation is a no-write smoke check that
-proves the helper path is usable without running a merge or touching user data.
+For reproducible bare-skill deployments, resolve the CM source to `v0.8.4`
+(tag pending; use the merge commit of this release’s docs PR until tagged) and
+install the matching CE pin (`v1.9.0` pending — tip `301858011097d6811801785380d056ecdd158dc9`). Until CE is
+tagged, product installers must record **“pending CE v1.9.0”** at that tip
+consistently rather than mixing v1.8.2 language. The final
+`preflight.py --help` invocation is a no-write smoke check that proves the
+helper path is usable without running a merge or touching user data.
