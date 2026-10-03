@@ -1,6 +1,5 @@
 # Installer contract
 
-**Status:** Installer contract, locked 2026-09-18  
 **Owner:** curiosity-merge (CM)  
 **Scope:** bare-skill, Switchbay, and okbay installation
 
