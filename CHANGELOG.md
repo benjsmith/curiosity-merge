@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.8.4 — 2026-09-29
+
+**Migration:** none. **Breaking:** none.
+
+Documents the **installer / UI-boundary contract** that already landed
+on `main` (`docs/INSTALLER-CONTRACT.md`) and reconciles integration **pin
+tables** with the upcoming skill-shell release wave:
+
+| Component | Pin | Notes |
+|---|---|---|
+| curiosity-merge | **v0.8.4** (this release) | Docs + pin bump only |
+| curiosity-engine | `71438fc38b78539f124fac9124439ae4c057a7d3` | curiosity-engine pin (`71438fc`). The curiosity-engine changelog at that commit names the release v1.9.0 |
+| Switchbay | **v0.13.0** | Consumer of CE/CM/okstratr embeds |
+
+### Clarified
+
+- **Installer contract:** bare-skill, Switchbay, and okbay install CM headlessly
+  via `scripts/setup.sh`; pins are tag **and** full commit; no floating
+  `main`/`latest` production pins.
+- **UI boundary:** CM owns **no** product UI (no PWA/QML/HTML/rail/tabs/
+  settings/daemon/proxy/registry). Shells present CM artifacts; CM returns
+  exit status + filesystem outputs.
+- Pin table previously froze CE at `v1.8.2` / CM at `v0.8.3`; product installers
+  should move to curiosity-merge **v0.8.4** paired with curiosity-engine
+  `71438fc38b78539f124fac9124439ae4c057a7d3` (`71438fc`). The curiosity-engine
+  changelog at that commit names the release v1.9.0. Record that pin
+  consistently rather than v1.8.2.
+
+### Unchanged
+
+- Runtime merge/export/hydrate behavior (still v0.8.3 semantics).
+- `docs/architecture.md` federation layout (no contradiction with the installer contract).
+
 ## v0.8.3 — 2026-09-05
 
 Closes the receiving half of the out-of-band source contract, and fixes a

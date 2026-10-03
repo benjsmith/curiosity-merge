@@ -16,9 +16,11 @@ This is a separate skill (not part of curiosity-engine) because it ingests exter
 
 The supported install is a **bare skill install** alongside an existing
 [curiosity-engine](https://github.com/benjsmith/curiosity-engine) workspace.
-For the Switchbay and okbay integration pins, use curiosity-merge **v0.8.3**
-(commit `4a533425f39a56bb23668a5d3831bf4df64fa0e8`). The exact consumer
-contract is in [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md).
+For the Switchbay and okbay integration pins, use curiosity-merge **v0.8.4**
+(this release — see [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md))
+paired with curiosity-engine `71438fc38b78539f124fac9124439ae4c057a7d3`
+(`71438fc`; the curiosity-engine changelog at that commit names the release v1.9.0).
+Do not mix v0.8.3 / v1.8.2 pin language with the v0.13 Switchbay wave.
 
 ```bash
 # Convenience install (latest published skill; pin the tag/SHA in a product installer).
