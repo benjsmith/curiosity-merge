@@ -18,9 +18,9 @@ a floating branch.
 
 | Component | Phase 3 pin | Commit | Consumers |
 |---|---|---|---|
-| curiosity-engine | `v1.9.0` (**pending tag**) | `71438fc38b78539f124fac9124439ae4c057a7d3` (`71438fc`, docs/release-v1.9.0 code tip, atlas 360-page gate) | Switchbay, okbay, bare CM dependency |
-| curiosity-merge | `v0.8.4` (**pending tag**; this release) | tip of `docs/release-v0.8.4` / [PR #3](https://github.com/benjsmith/curiosity-merge/pull/3) until merge to main | Switchbay and okbay |
-| switchbay (consumer) | `v0.13.0` (**pending**) | — | Records CE+CM pins in its release metadata |
+| curiosity-engine | `71438fc38b78539f124fac9124439ae4c057a7d3` | `71438fc38b78539f124fac9124439ae4c057a7d3` (`71438fc`; the curiosity-engine changelog at that commit names the release v1.9.0; atlas 360-page gate) | Switchbay, okbay, bare CM dependency |
+| curiosity-merge | `v0.8.4` (this release) | tip of `docs/release-v0.8.4` / [PR #3](https://github.com/benjsmith/curiosity-merge/pull/3) | Switchbay and okbay |
+| switchbay (consumer) | `v0.13.0` | — | Records CE+CM pins in its release metadata |
 
 These are the current integration pins, not a promise that every CM command
 requires this exact curiosity-engine release. CM imports curiosity-engine
@@ -116,10 +116,11 @@ source .curator/.curiosity-merge-env
 uv run python3 <skill_path>/scripts/preflight.py --help
 ```
 
-For reproducible bare-skill deployments, resolve the CM source to `v0.8.4`
-(tag pending; use the merge commit of this release’s docs PR until tagged) and
-install the matching CE pin (`v1.9.0` pending — tip `71438fc38b78539f124fac9124439ae4c057a7d3`). Until CE is
-tagged, product installers must record **“pending CE v1.9.0”** at that tip
-consistently rather than mixing v1.8.2 language. The final
+For reproducible bare-skill deployments, resolve the CM source to this
+`v0.8.4` release (`docs/release-v0.8.4`, [PR #3](https://github.com/benjsmith/curiosity-merge/pull/3)) and
+install curiosity-engine `71438fc38b78539f124fac9124439ae4c057a7d3`
+(`71438fc`). The curiosity-engine changelog at that commit names the release
+v1.9.0. Product installers must record that curiosity-engine pin rather than
+mixing v1.8.2 language. The final
 `preflight.py --help` invocation is a no-write smoke check that proves the
 helper path is usable without running a merge or touching user data.
