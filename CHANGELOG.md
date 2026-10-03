@@ -4,7 +4,7 @@
 
 **Migration:** none. **Breaking:** none.
 
-Documents the **Phase 3 installer / UI-boundary contract** that already landed
+Documents the **installer / UI-boundary contract** that already landed
 on `main` (`docs/INSTALLER-CONTRACT.md`) and reconciles integration **pin
 tables** with the upcoming skill-shell release wave:
 
@@ -31,7 +31,7 @@ tables** with the upcoming skill-shell release wave:
 ### Unchanged
 
 - Runtime merge/export/hydrate behavior (still v0.8.3 semantics).
-- `docs/architecture.md` federation layout (no contradiction with Phase 3).
+- `docs/architecture.md` federation layout (no contradiction with the installer contract).
 
 ## v0.8.3 — 2026-09-05
 

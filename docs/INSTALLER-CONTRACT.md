@@ -1,6 +1,6 @@
 # Installer contract
 
-**Status:** Phase 3 contract, locked 2026-09-18 (pins refreshed 2026-09-29 for v0.8.4)  
+**Status:** Installer contract, locked 2026-09-18 (pins refreshed 2026-09-29 for v0.8.4)  
 **Owner:** curiosity-merge (CM)  
 **Scope:** bare-skill, Switchbay, and okbay installation
 
@@ -16,10 +16,10 @@ human-readable release name; the commit is the machine-verifiable content
 pin. If they disagree, installation must stop rather than silently resolving
 a floating branch.
 
-| Component | Phase 3 pin | Commit | Consumers |
+| Component | Pin | Commit | Consumers |
 |---|---|---|---|
 | curiosity-engine | `71438fc38b78539f124fac9124439ae4c057a7d3` | `71438fc38b78539f124fac9124439ae4c057a7d3` (`71438fc`; the curiosity-engine changelog at that commit names the release v1.9.0; atlas 360-page gate) | Switchbay, okbay, bare CM dependency |
-| curiosity-merge | `v0.8.4` (this release) | tip of `docs/release-v0.8.4` / [PR #3](https://github.com/benjsmith/curiosity-merge/pull/3) | Switchbay and okbay |
+| curiosity-merge | `v0.8.4` (this release) | `v0.8.4`, the version `CHANGELOG.md` claims (2026-09-29) | Switchbay and okbay |
 | switchbay (consumer) | `v0.13.0` | — | Records CE+CM pins in its release metadata |
 
 These are the current integration pins, not a promise that every CM command
@@ -116,8 +116,8 @@ source .curator/.curiosity-merge-env
 uv run python3 <skill_path>/scripts/preflight.py --help
 ```
 
-For reproducible bare-skill deployments, resolve the CM source to this
-`v0.8.4` release (`docs/release-v0.8.4`, [PR #3](https://github.com/benjsmith/curiosity-merge/pull/3)) and
+For reproducible bare-skill deployments, resolve the CM source to `v0.8.4`,
+the version `CHANGELOG.md` claims for this release, and
 install curiosity-engine `71438fc38b78539f124fac9124439ae4c057a7d3`
 (`71438fc`). The curiosity-engine changelog at that commit names the release
 v1.9.0. Product installers must record that curiosity-engine pin rather than
