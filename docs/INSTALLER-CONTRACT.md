@@ -18,7 +18,7 @@ a floating branch.
 
 | Component | Phase 3 pin | Commit | Consumers |
 |---|---|---|---|
-| curiosity-engine | `v1.9.0` (**pending tag**) | `301858011097d6811801785380d056ecdd158dc9` (origin/main tip at docs cut) | Switchbay, okbay, bare CM dependency |
+| curiosity-engine | `v1.9.0` (**pending tag**) | `86451bd53e5a3fe285df8e97323e4ca579fdef7b` (origin/main 2026-10-03, procedure types merged) | Switchbay, okbay, bare CM dependency |
 | curiosity-merge | `v0.8.4` (**pending tag**; this release) | tip of `docs/release-v0.8.4` / [PR #3](https://github.com/benjsmith/curiosity-merge/pull/3) until merge to main | Switchbay and okbay |
 | switchbay (consumer) | `v0.13.0` (**pending**) | — | Records CE+CM pins in its release metadata |
 
@@ -118,7 +118,7 @@ uv run python3 <skill_path>/scripts/preflight.py --help
 
 For reproducible bare-skill deployments, resolve the CM source to `v0.8.4`
 (tag pending; use the merge commit of this release’s docs PR until tagged) and
-install the matching CE pin (`v1.9.0` pending — tip `301858011097d6811801785380d056ecdd158dc9`). Until CE is
+install the matching CE pin (`v1.9.0` pending — tip `86451bd53e5a3fe285df8e97323e4ca579fdef7b`). Until CE is
 tagged, product installers must record **“pending CE v1.9.0”** at that tip
 consistently rather than mixing v1.8.2 language. The final
 `preflight.py --help` invocation is a no-write smoke check that proves the

@@ -11,7 +11,7 @@ tables** with the upcoming skill-shell release wave:
 | Component | Pin | Notes |
 |---|---|---|
 | curiosity-merge | **v0.8.4** (this release) | Docs + pin bump only |
-| curiosity-engine | **v1.9.0** (pending tag) | Code tip `3018580` (`301858011097d6811801785380d056ecdd158dc9`); CE docs PR open for release notes |
+| curiosity-engine | **v1.9.0** (pending tag) | Code tip `86451bd` (`86451bd53e5a3fe285df8e97323e4ca579fdef7b`); CE docs PR open for release notes |
 | Switchbay | **v0.13.0** (pending) | Consumer of CE/CM/okstratr embeds — record when SB tags |
 
 ### Clarified
@@ -24,7 +24,7 @@ tables** with the upcoming skill-shell release wave:
   exit status + filesystem outputs.
 - Pin table previously froze CE at `v1.8.2` / CM at `v0.8.3`; product installers
   should move to the pair above once CE **v1.9.0** and CM **v0.8.4** are tagged.
-  Until CE is tagged, record “pending CE v1.9.0” at tip `3018580` consistently.
+  Until CE is tagged, record “pending CE v1.9.0” at tip `86451bd` consistently.
 
 ### Unchanged
 

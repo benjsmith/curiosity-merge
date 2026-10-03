@@ -18,7 +18,7 @@ The supported install is a **bare skill install** alongside an existing
 [curiosity-engine](https://github.com/benjsmith/curiosity-engine) workspace.
 For the Switchbay and okbay integration pins, use curiosity-merge **v0.8.4**
 (tag pending — see [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md))
-paired with curiosity-engine **v1.9.0** (pending tag; tip `3018580`).
+paired with curiosity-engine **v1.9.0** (pending tag; tip `86451bd`).
 Do not mix v0.8.3 / v1.8.2 pin language with the v0.13 Switchbay wave.
 
 ```bash
