@@ -35,10 +35,9 @@ Switchbay/okbay pins and release-bump procedure.
 
 The Switchbay/okbay integration pin is CM `v0.8.4` (this release). The
 corresponding curiosity-engine pin for that pair is
-curiosity-engine `71438fc38b78539f124fac9124439ae4c057a7d3` (`71438fc`). The
-curiosity-engine changelog at that commit names the release v1.9.0. Consumers
-must pin that full commit; an unqualified branch or “latest” is not a release pin.
-Switchbay consumer release: **v0.13.0**.
+curiosity-engine **v1.9.2** (`9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f`). Consumers
+must pin the tag and that full commit; an unqualified branch or “latest” is not a release pin.
+Switchbay consumer release: **v0.14.1**.
 
 ## Product UI boundary
 

@@ -17,9 +17,9 @@ a floating branch.
 
 | Component | Pin | Commit | Consumers |
 |---|---|---|---|
-| curiosity-engine | `71438fc38b78539f124fac9124439ae4c057a7d3` | `71438fc38b78539f124fac9124439ae4c057a7d3` (`71438fc`; the curiosity-engine changelog at that commit names the release v1.9.0; atlas 360-page gate) | Switchbay, okbay, bare CM dependency |
+| curiosity-engine | `v1.9.2` | `9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f` | Switchbay, okbay, bare CM dependency |
 | curiosity-merge | `v0.8.4` (this release) | `v0.8.4`, the version `CHANGELOG.md` claims (2026-09-29) | Switchbay and okbay |
-| switchbay (consumer) | `v0.13.0` | — | Records CE+CM pins in its release metadata |
+| switchbay (consumer) | `v0.14.1` | — | Records CE+CM pins in its release metadata |
 
 These are the current integration pins, not a promise that every CM command
 requires this exact curiosity-engine release. CM imports curiosity-engine
@@ -117,9 +117,7 @@ uv run python3 <skill_path>/scripts/preflight.py --help
 
 For reproducible bare-skill deployments, resolve the CM source to `v0.8.4`,
 the version `CHANGELOG.md` claims for this release, and
-install curiosity-engine `71438fc38b78539f124fac9124439ae4c057a7d3`
-(`71438fc`). The curiosity-engine changelog at that commit names the release
-v1.9.0. Product installers must record that curiosity-engine pin rather than
-mixing v1.8.2 language. The final
+install curiosity-engine `v1.9.2` (`9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f`). Product installers must
+record that tag and commit together. The final
 `preflight.py --help` invocation is a no-write smoke check that proves the
 helper path is usable without running a merge or touching user data.
