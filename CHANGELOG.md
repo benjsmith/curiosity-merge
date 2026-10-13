@@ -2,13 +2,15 @@
 
 ## Unreleased
 
+## v0.8.5 — 2026-10-13
+
 **Migration:** none. **Breaking:** none.
 
 ### Changed
 
 - Integration pins now point at curiosity-engine **v1.9.2**
   (`9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f`) and Switchbay **v0.14.1**. The curiosity-merge pin
-  stays at v0.8.4; runtime behavior is unchanged.
+  moves to v0.8.5 (this release); runtime behavior is unchanged.
 
 ## v0.8.4 — 2026-09-29
 

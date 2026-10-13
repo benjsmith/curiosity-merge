@@ -33,7 +33,7 @@ and CI should set `CURIOSITY_MERGE_NONINTERACTIVE=1` to skip optional prompts.
 See [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md) for the
 Switchbay/okbay pins and release-bump procedure.
 
-The Switchbay/okbay integration pin is CM `v0.8.4` (this release). The
+The Switchbay/okbay integration pin is CM `v0.8.5` (this release). The
 corresponding curiosity-engine pin for that pair is
 curiosity-engine **v1.9.2** (`9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f`). Consumers
 must pin the tag and that full commit; an unqualified branch or “latest” is not a release pin.

@@ -18,7 +18,7 @@ a floating branch.
 | Component | Pin | Commit | Consumers |
 |---|---|---|---|
 | curiosity-engine | `v1.9.2` | `9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f` | Switchbay, okbay, bare CM dependency |
-| curiosity-merge | `v0.8.4` (this release) | `v0.8.4`, the version `CHANGELOG.md` claims (2026-09-29) | Switchbay and okbay |
+| curiosity-merge | `v0.8.5` (this release) | `v0.8.5`, the version `CHANGELOG.md` claims (2026-10-13) | Switchbay and okbay |
 | switchbay (consumer) | `v0.14.1` | — | Records CE+CM pins in its release metadata |
 
 These are the current integration pins, not a promise that every CM command
@@ -115,7 +115,7 @@ source .curator/.curiosity-merge-env
 uv run python3 <skill_path>/scripts/preflight.py --help
 ```
 
-For reproducible bare-skill deployments, resolve the CM source to `v0.8.4`,
+For reproducible bare-skill deployments, resolve the CM source to `v0.8.5`,
 the version `CHANGELOG.md` claims for this release, and
 install curiosity-engine `v1.9.2` (`9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f`). Product installers must
 record that tag and commit together. The final

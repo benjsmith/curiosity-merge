@@ -16,7 +16,7 @@ This is a separate skill (not part of curiosity-engine) because it ingests exter
 
 The supported install is a **bare skill install** alongside an existing
 [curiosity-engine](https://github.com/benjsmith/curiosity-engine) workspace.
-For the Switchbay and okbay integration pins, use curiosity-merge **v0.8.4**
+For the Switchbay and okbay integration pins, use curiosity-merge **v0.8.5**
 (this release — see [`docs/INSTALLER-CONTRACT.md`](docs/INSTALLER-CONTRACT.md))
 paired with curiosity-engine **v1.9.2** (`9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f`)
 and Switchbay **v0.14.1**.
