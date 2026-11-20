@@ -81,6 +81,25 @@ For a source re-acquired independently (institutional access, a purchased copy),
 
 See `docs/licensing.md` for the full table, manifest-safety contract, density rules, and Presidio reference.
 
+## When the same page changed in two places
+
+A mounted graph can receive a page you also edited locally. `page_merge.py` compares the common ancestor with both copies.
+
+- List fields (`sources`, `supports`, `contradicts`, `same_as`, `projects`, `aliases`, `labels`) are combined.
+- If only one copy changed the prose, that copy is kept.
+- If both copies changed the prose, neither is discarded. The result is a conflict for a person to review.
+
+```
+uv run python3 <skill_path>/scripts/page_merge.py \
+    --base base.md --ours ours.md --theirs theirs.md
+```
+
+Exit 0 means the page merged. Exit 1 means a person has to choose. The JSON on stdout includes both prose versions when it does not merge.
+
+`ontology_align.py compare` reads two `.curator/meta-ontology.yaml` files. Terms with the same name and the same endpoints are the same term. The same name with different endpoints is reported and not merged. Built-in page types always match. `ontology_align.py adapt` rewrites one page into the other graph's vocabulary using a map you approved. A term that still has no match becomes `concept`, and the original term is listed in the output so you can record it.
+
+`subgraph_export.py --max-classification public` leaves out pages at a higher label, including a page that only cites one. The labels are `public`, `internal`, `confidential`, and `restricted`.
+
 ## The five verbs
 
 ### `subgraph-export` — extract a self-contained mini-wiki

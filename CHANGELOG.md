@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `page_merge.py` merges one page from two copies. List fields combine. If both copies changed the prose, neither is overwritten.
+- `ontology_align.py` compares two meta-ontology files and can rewrite a page into the other vocabulary. A term with no match becomes `concept`, and the original term is reported.
+- `subgraph_export.py --max-classification` leaves out pages above that label, including a page that only cites one.
+
 ## v0.8.5 — 2026-10-13
 
 **Migration:** none. **Breaking:** none.
