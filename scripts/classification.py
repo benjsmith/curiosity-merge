@@ -22,6 +22,16 @@ def above(label: str | None, ceiling: str) -> bool:
     return rank(label) > rank(ceiling)
 
 
+_EXPORT_SKIP = frozenset({
+    ".workbench", ".git", "captures", "graph-cache", "graph-tokens", "audit", "mounts",
+})
+
+
+def export_excluded(rel: str) -> bool:
+    parts = [part for part in rel.replace("\\", "/").split("/") if part]
+    return any(part in _EXPORT_SKIP for part in parts)
+
+
 def highest(labels: list[str | None]) -> str:
     best = "public"
     for label in labels:

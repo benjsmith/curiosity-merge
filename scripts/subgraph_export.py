@@ -509,9 +509,12 @@ def _filter_vault_for_mode(vault_files: list[Path], mode: str,
 
 
 def _copy_pages(scope_pages: list[Path], wiki_dir: Path, dest_wiki: Path) -> list[str]:
+    from classification import export_excluded
     rels: list[str] = []
     for p in scope_pages:
         rel = p.relative_to(wiki_dir)
+        if export_excluded(rel.as_posix()):
+            continue
         target = dest_wiki / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, target)
@@ -520,9 +523,12 @@ def _copy_pages(scope_pages: list[Path], wiki_dir: Path, dest_wiki: Path) -> lis
 
 
 def _copy_vault(vault_files: list[Path], vault_dir: Path, dest_vault: Path) -> list[str]:
+    from classification import export_excluded
     rels: list[str] = []
     for f in vault_files:
         rel = f.relative_to(vault_dir)
+        if export_excluded(rel.as_posix()):
+            continue
         target = dest_vault / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, target)

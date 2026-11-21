@@ -79,6 +79,14 @@ def test_adapt_rewrites_unknown_type_and_records_it(align_mod):
     assert notes2[0]["to"] == "evidence"
 
 
+def test_export_skips_state_directories():
+    sys.path.insert(0, str(SCRIPTS))
+    import classification
+    assert classification.export_excluded("captures/note.md")
+    assert classification.export_excluded(".workbench/state/page.json")
+    assert not classification.export_excluded("concepts/open.md")
+
+
 def test_export_drops_pages_above_ceiling(tmp_path):
     wiki = tmp_path / "wiki"
     _write(wiki / "concepts" / "open.md", "---\ntitle: Open\ntype: concept\nclassification: public\n---\n\nPublic.\n")
