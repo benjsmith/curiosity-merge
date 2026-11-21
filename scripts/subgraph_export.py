@@ -509,9 +509,12 @@ def _filter_vault_for_mode(vault_files: list[Path], mode: str,
 
 
 def _copy_pages(scope_pages: list[Path], wiki_dir: Path, dest_wiki: Path) -> list[str]:
+    from classification import export_excluded
     rels: list[str] = []
     for p in scope_pages:
         rel = p.relative_to(wiki_dir)
+        if export_excluded(rel.as_posix()):
+            continue
         target = dest_wiki / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(p, target)
@@ -520,9 +523,12 @@ def _copy_pages(scope_pages: list[Path], wiki_dir: Path, dest_wiki: Path) -> lis
 
 
 def _copy_vault(vault_files: list[Path], vault_dir: Path, dest_vault: Path) -> list[str]:
+    from classification import export_excluded
     rels: list[str] = []
     for f in vault_files:
         rel = f.relative_to(vault_dir)
+        if export_excluded(rel.as_posix()):
+            continue
         target = dest_vault / rel
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(f, target)
@@ -824,6 +830,11 @@ def main(argv: list[str] | None = None) -> int:
                          "complies.")
     ap.add_argument("--force", action="store_true",
                     help="overwrite existing files at destination")
+    ap.add_argument("--max-classification", default="",
+                    metavar="LEVEL",
+                    help="drop pages above this label "
+                         "(public, internal, confidential, restricted). "
+                         "A page inherits the highest label it cites.")
     args = ap.parse_args(argv)
 
     if args.include_1_hop and not args.page:
@@ -894,6 +905,38 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(
                 "scope matched only non-native pages; nothing to export "
                 "(pass --include-non-native if you intend to ship them)"
+            )
+
+    ceiling = (args.max_classification or "").strip().lower()
+    if ceiling:
+        from classification import above, highest
+        labels: dict[Path, str] = {}
+        for page in all_pages:
+            labels[page] = _raw_frontmatter(
+                page.read_text(errors="replace")).get("classification", "public")
+        kept = []
+        for page in scope_pages:
+            text = page.read_text(errors="replace")
+            own = labels.get(page, "public")
+            cited = [own]
+            for match in re.findall(r"\[\[([^\]\n]+)\]\]", text):
+                stem = Path(match.split("|", 1)[0].strip()).name.casefold()
+                for other, label in labels.items():
+                    if other.stem.casefold() == stem:
+                        cited.append(label)
+            if above(highest(cited), ceiling):
+                continue
+            kept.append(page)
+        dropped = len(scope_pages) - len(kept)
+        if dropped:
+            sys.stderr.write(
+                f"subgraph-export: excluded {dropped} page(s) above "
+                f"{ceiling}\n"
+            )
+        scope_pages = kept
+        if not scope_pages:
+            raise SystemExit(
+                f"every page in scope is above {ceiling}; nothing to export"
             )
 
     cited_vault_files = _collect_cited_vault(scope_pages, vault_dir)
