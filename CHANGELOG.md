@@ -2,9 +2,22 @@
 
 ## Unreleased
 
+## v0.9.0 — 2026-11-21
+
+**Migration:** none. **Breaking:** none.
+
+### Added
+
 - `page_merge.py` merges one page from two copies. List fields combine. If both copies changed the prose, neither is overwritten.
 - `ontology_align.py` compares two meta-ontology files and can rewrite a page into the other vocabulary. A term with no match becomes `concept`, and the original term is reported.
 - `subgraph_export.py --max-classification` leaves out pages above that label, including a page that only cites one.
+- `subgraph-export` leaves out `.workbench`, `.git`, `captures`, `graph-cache`, `graph-tokens`, `audit`, and `mounts`.
+
+### Unchanged
+
+- The curiosity-engine pin stays at **v1.9.2**
+  (`9d83250f7dfde2d13dd5c6fcdf26bf63aeeef48f`). Switchbay stays at **v0.14.1**.
+  The curiosity-merge pin moves to v0.9.0 (this release).
 
 ## v0.8.5 — 2026-10-13
 
